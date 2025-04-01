@@ -1,29 +1,19 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Satellite dynamics: constant velocity model with time-varying acceleration
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Satellite dynamics: constant velocity model
 def simulate_satellite_motion(x0, F, steps, Q):
-    x = x0.copy()
-    states = [x.copy()]
-    
-    for t in range(steps):
-        # Add time-dependent acceleration to create turns
-        acceleration = np.zeros(4)
-        
-        # First turn (around step 15)
-        if 10 <= t < 20:
-            acceleration[2] = -0.1  # x acceleration
-            acceleration[3] = 0.1   # y acceleration
-        # Second turn (around step 35)
-        elif 30 <= t < 40:
-            acceleration[2] = 0.1   # x acceleration
-            acceleration[3] = -0.1  # y acceleration
-            
+    x = x0
+    states = [x]
+    for _ in range(steps):
         w = np.random.multivariate_normal(np.zeros(len(Q)), Q)
-        x = F @ x + acceleration + w
-        states.append(x.copy())
-        
-    return np.array(states)
+        x = F @ x + w
+       
+
+
 
 # Simulation parameters
 dt = 1.0
@@ -41,9 +31,14 @@ H = np.array([[1, 0, 0, 0],
 Q = 0.01 * np.eye(4)
 R = 0.5 * np.eye(2)
 
-# Simulate true satellite motion with two turns
-states = simulate_satellite_motion(x0, F, steps, Q)
-true_trajectory = states[:, :2]  # Extract position components
+# Simulate true satellite motion
+x_true = x0.copy()
+true_trajectory = [x_true[:2]]
+for _ in range(steps):
+    w = np.random.multivariate_normal(np.zeros(4), Q)
+    x_true = F @ x_true + w
+    true_trajectory.append(x_true[:2])
+true_trajectory = np.array(true_trajectory)
 
 # Each station has its own KF state
 x_estimates = [x0 + np.random.randn(4) for _ in range(num_stations)]
