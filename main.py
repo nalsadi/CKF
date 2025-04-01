@@ -266,6 +266,7 @@ def run_simulation():
     node_trajectories = [[] for _ in range(4)]
     estimated_trajectories = [[] for _ in range(4)]
     rmse_history = []
+    consensus_trajectory = []
     
     # Main simulation loop
     for k in range(n_steps):
@@ -290,7 +291,11 @@ def run_simulation():
         # Store estimates
         for i in range(len(nodes)):
             estimated_trajectories[i].append(np.array([x_estimates[i][0], x_estimates[i][2]]))
-            
+        
+        # Calculate and store consensus estimate
+        consensus_state = np.mean([x[0:4:2] for x in x_estimates], axis=0)
+        consensus_trajectory.append(consensus_state)
+        
         # Calculate RMSE for this timestep
         rmse = np.sqrt(np.mean([(x_estimates[i][0] - target.state[0])**2 + 
                                (x_estimates[i][2] - target.state[2])**2 
@@ -301,21 +306,23 @@ def run_simulation():
     target_trajectory = np.array(target_trajectory)
     node_trajectories = [np.array(traj) for traj in node_trajectories]
     estimated_trajectories = [np.array(traj) for traj in estimated_trajectories]
+    consensus_trajectory = np.array(consensus_trajectory)
     rmse_history = np.array(rmse_history)
     
-    # Plot 2D trajectories with estimates
+    # Plot 2D trajectories with estimates and consensus
     plt.figure(figsize=(12, 8))
     plt.plot(target_trajectory[:,0], target_trajectory[:,1], 'r-', label='Target')
+    plt.plot(consensus_trajectory[:,0], consensus_trajectory[:,1], 'k--', linewidth=2, label='Consensus Estimate')
     
     colors = ['b', 'g', 'c', 'm']
     for i, traj in enumerate(node_trajectories):
         plt.plot(traj[:,0], traj[:,1], f'{colors[i]}.-', label=f'Sensor {i+1}')
         plt.plot(estimated_trajectories[i][:,0], estimated_trajectories[i][:,1], 
-                f'{colors[i]}--', label=f'Estimate {i+1}')
+                f'{colors[i]}:', alpha=0.5, label=f'Local Estimate {i+1}')
     
     plt.xlabel('X Position (km)')
     plt.ylabel('Y Position (km)')
-    plt.title('2D Trajectories with Estimates')
+    plt.title('2D Trajectories with Local and Consensus Estimates')
     plt.legend()
     plt.grid(True)
     plt.show()
@@ -342,10 +349,14 @@ def run_simulation():
         ax.plot(traj[:,0], traj[:,1], 
                 np.ones_like(traj[:,0])*0.2, f'{colors[i]}.-', label=f'Sensor {i+1}')
     
+    # Consensus trajectory
+    ax.plot(consensus_trajectory[:,0], consensus_trajectory[:,1], 
+            np.ones_like(consensus_trajectory[:,0])*0.5, 'k--', linewidth=2, label='Consensus Estimate')
+    
     ax.set_xlabel('X Position (km)')
     ax.set_ylabel('Y Position (km)')
     ax.set_zlabel('Height (km)')
-    ax.set_title('3D Trajectories')
+    ax.set_title('3D Trajectories with Consensus Estimate')
     plt.legend()
     plt.show()
 
