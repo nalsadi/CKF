@@ -1,88 +1,274 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.linalg import block_diag
+from mpl_toolkits.mplot3d import Axes3D
 
-# Satellite dynamics: constant velocity model
-def simulate_satellite_motion(x0, F, steps, Q):
-    x = x0
-    states = [x]
-    for _ in range(steps):
-        w = np.random.multivariate_normal(np.zeros(len(Q)), Q)
-        x = F @ x + w
+# Target motion model with turning capability
+def target_motion_model(x, dt, omega):
+    # State: [x, vx, y, vy]
+    # omega: turning rate in rad/s
+    F = np.array([
+        [1, np.sin(omega*dt)/omega, 0, -(1-np.cos(omega*dt))/omega],
+        [0, np.cos(omega*dt), 0, -np.sin(omega*dt)],
+        [0, (1-np.cos(omega*dt))/omega, 1, np.sin(omega*dt)/omega],
+        [0, np.sin(omega*dt), 0, np.cos(omega*dt)]
+    ]) if abs(omega) > 1e-10 else np.array([
+        [1, dt, 0, 0],
+        [0, 1, 0, 0],
+        [0, 0, 1, dt],
+        [0, 0, 0, 1]
+    ])
+    
+    return F @ x
+
+# Measurement model: range, azimuth, elevation
+def measurement_model(x, sensor_pos):
+    # x: target state [x, vx, y, vy]
+    # sensor_pos: [x, y, z] of sensor
+    dx = x[0] - sensor_pos[0]
+    dy = x[2] - sensor_pos[1]
+    dz = 0.5 - sensor_pos[2]  # Target height - sensor height
+    
+    # Range
+    r = np.sqrt(dx**2 + dy**2 + dz**2)
+    
+    # Azimuth angle
+    psi = np.arctan2(dy, dx)
+    
+    # Elevation angle
+    theta = np.arctan2(dz, np.sqrt(dx**2 + dy**2))
+    
+    return np.array([r, psi, theta])
+
+# Jacobian of the measurement model
+def measurement_jacobian(x, sensor_pos):
+    # x: target state [x, vx, y, vy]
+    # sensor_pos: [x, y, z] of sensor
+    dx = x[0] - sensor_pos[0]
+    dy = x[2] - sensor_pos[1]
+    dz = 0.5 - sensor_pos[2]  # Target height - sensor height
+    
+    r = np.sqrt(dx**2 + dy**2 + dz**2)
+    r_xy = np.sqrt(dx**2 + dy**2)
+    
+    # Partial derivatives for range
+    dr_dx = dx / r
+    dr_dy = dy / r
+    
+    # Partial derivatives for azimuth
+    dpsi_dx = -dy / (dx**2 + dy**2)
+    dpsi_dy = dx / (dx**2 + dy**2)
+    
+    # Partial derivatives for elevation
+    dtheta_dx = -dx * dz / (r_xy * r**2)
+    dtheta_dy = -dy * dz / (r_xy * r**2)
+    
+    # Assemble Jacobian matrix (3x4)
+    H = np.array([
+        [dr_dx, 0, dr_dy, 0],
+        [dpsi_dx, 0, dpsi_dy, 0],
+        [dtheta_dx, 0, dtheta_dy, 0]
+    ])
+    
+    return H
 
 # Simulation parameters
-dt = 1.0
-steps = 50
-num_stations = 5
+dt = 0.5  # Time step (s)
+steps = 100
+omega = np.deg2rad(0.5)  # Turning rate (rad/s)
+target_height = 0.5  # km
+sensor_height = 0.2  # km
 
-# State vector: [x, y, vx, vy]
-x0 = np.array([0, 0, 1, 0.5])
-F = np.array([[1, 0, dt, 0],
-              [0, 1, 0, dt],
-              [0, 0, 1,  0],
-              [0, 0, 0,  1]])
-H = np.array([[1, 0, 0, 0],
-              [0, 1, 0, 0]])
-Q = 0.01 * np.eye(4)
-R = 0.5 * np.eye(2)
+# Set up sensor network
+# Format: [x, y, z, vx, vy, vz]
+static_sensors = [
+    [25, 10, sensor_height, 0, 0, 0],  # Scaled down from 2500, 1000
+    [35, 10, sensor_height, 0, 0, 0],  # Scaled down from 3500, 1000
+    [45, 10, sensor_height, 0, 0, 0]   # Scaled down from 4500, 1000
+]
+mobile_sensor = [15, 0, sensor_height, 0.1, 0.2, 0]  # Scaled down from 1500, 0 with 10, 20 speed
 
-# Simulate true satellite motion
-x_true = x0.copy()
-true_trajectory = [x_true[:2]]
-for _ in range(steps):
-    w = np.random.multivariate_normal(np.zeros(4), Q)
-    x_true = F @ x_true + w
-    true_trajectory.append(x_true[:2])
-true_trajectory = np.array(true_trajectory)
+sensors = static_sensors + [mobile_sensor]
+num_sensors = len(sensors)
 
-# Each station has its own KF state
-x_estimates = [x0 + np.random.randn(4) for _ in range(num_stations)]
-P_estimates = [np.eye(4) for _ in range(num_stations)]
-measurements = [[] for _ in range(num_stations)]
-est_trajectories = [[] for _ in range(num_stations)]
+# Initial target state [x, vx, y, vy]
+x0_true = np.array([20, 0, 100, 0])  # Scaled down from 2000, 10000
+
+# Process and measurement noise
+Q = 1e-5 * np.eye(4)  # Process noise covariance
+# Measurement noise for [range, azimuth, elevation]
+R = np.diag([0.1**2, np.deg2rad(1)**2, np.deg2rad(1)**2])
+
+# Simulate true target trajectory
+x_true = x0_true.copy()
+true_trajectory = [x_true.copy()]
 
 for t in range(steps):
-    z_true = true_trajectory[t+1]
+    # Apply process noise
+    w = np.random.multivariate_normal(np.zeros(4), Q)
+    
+    # Update true state with turning model
+    x_true = target_motion_model(x_true, dt, omega) + w
+    true_trajectory.append(x_true.copy())
 
-    for i in range(num_stations):
-        # Simulate noisy measurement
-        z = z_true + np.random.multivariate_normal(np.zeros(2), R)
+true_trajectory = np.array(true_trajectory)
+
+# Initialize EKF for each sensor
+x_estimates = [np.array([20, 0.1, 100, 0.1]) for _ in range(num_sensors)]  # Initial guess
+P_estimates = [np.eye(4) * 10 for _ in range(num_sensors)]  # Initial covariance
+est_trajectories = [[] for _ in range(num_sensors)]
+measurements = [[] for _ in range(num_sensors)]
+
+# Update sensor positions over time
+sensor_positions = []
+for t in range(steps + 1):
+    current_positions = []
+    for i, sensor in enumerate(sensors):
+        # Update mobile sensor position
+        if i == num_sensors - 1:  # Last sensor is mobile
+            sensor[0] += sensor[3] * dt
+            sensor[1] += sensor[4] * dt
+        current_positions.append(sensor[:3])  # Store x, y, z
+    sensor_positions.append(current_positions)
+
+# Run EKF for each sensor
+for t in range(steps):
+    for i in range(num_sensors):
+        # Current sensor position [x, y, z]
+        sensor_pos = sensor_positions[t][i]
+        
+        # Generate true measurement from target to sensor
+        z_true = measurement_model(true_trajectory[t+1], sensor_pos)
+        
+        # Add measurement noise
+        v = np.random.multivariate_normal(np.zeros(3), R)
+        z = z_true + v
         measurements[i].append(z)
-
-        # Predict
-        x_pred = F @ x_estimates[i]
+        
+        # Predict step
+        x_pred = target_motion_model(x_estimates[i], dt, omega)
+        F = target_motion_model(np.eye(4), dt, omega)  # State transition matrix
         P_pred = F @ P_estimates[i] @ F.T + Q
-
-        # Update
-        y = z - H @ x_pred
+        
+        # Update step
+        H = measurement_jacobian(x_pred, sensor_pos)
+        z_pred = measurement_model(x_pred, sensor_pos)
+        y = z - z_pred  # Innovation
+        
+        # Wrap angle differences to [-pi, pi]
+        y[1:3] = np.arctan2(np.sin(y[1:3]), np.cos(y[1:3]))
+        
         S = H @ P_pred @ H.T + R
         K = P_pred @ H.T @ np.linalg.inv(S)
         x_estimates[i] = x_pred + K @ y
         P_estimates[i] = (np.eye(4) - K @ H) @ P_pred
+        
+        est_trajectories[i].append(x_estimates[i].copy())
 
-        est_trajectories[i].append(x_estimates[i][:2])
+# Convert to numpy arrays
+est_trajectories = [np.array(traj) for traj in est_trajectories]
 
-# Calculate consensus estimate by averaging all station estimates
+# Calculate consensus estimate by averaging all sensor estimates
 consensus_trajectory = []
 for t in range(steps):
-    consensus_state = np.zeros(2)
-    for i in range(num_stations):
+    consensus_state = np.zeros(4)
+    for i in range(num_sensors):
         consensus_state += est_trajectories[i][t]
-    consensus_state /= num_stations
+    consensus_state /= num_sensors
     consensus_trajectory.append(consensus_state)
 consensus_trajectory = np.array(consensus_trajectory)
 
-# Plotting
-plt.figure(figsize=(10, 6))
-plt.plot(true_trajectory[:, 0], true_trajectory[:, 1], 'k-', label='True trajectory')
-for i in range(num_stations):
-    est = np.array(est_trajectories[i])
-    plt.plot(est[:, 0], est[:, 1], '--', label=f'Station {i+1} estimate')
-# Add consensus estimate to plot
-plt.plot(consensus_trajectory[:, 0], consensus_trajectory[:, 1], 'r-', linewidth=2, label='Consensus estimate')
-plt.xlabel('X position')
-plt.ylabel('Y position')
+# Plotting the results
+plt.figure(figsize=(12, 8))
+
+# Plot the 2D trajectory
+plt.subplot(2, 2, 1)
+plt.plot(true_trajectory[:, 0], true_trajectory[:, 2], 'k-', linewidth=2, label='True trajectory')
+for i in range(num_sensors):
+    plt.plot(est_trajectories[i][:, 0], est_trajectories[i][:, 2], '--', label=f'Sensor {i+1} estimate')
+plt.plot(consensus_trajectory[:, 0], consensus_trajectory[:, 2], 'r-', linewidth=2, label='Consensus estimate')
+
+# Plot sensor positions
+for t in [0, -1]:  # Plot initial and final positions
+    for i, pos in enumerate(sensor_positions[t]):
+        if i == num_sensors - 1:  # Mobile sensor
+            plt.plot(pos[0], pos[1], 'ro', markersize=8)
+            plt.text(pos[0], pos[1], f'Mobile {t}')
+        else:
+            plt.plot(pos[0], pos[1], 'bo', markersize=8)
+            plt.text(pos[0], pos[1], f'S{i+1}')
+
+plt.xlabel('X position (km)')
+plt.ylabel('Y position (km)')
+plt.title('Target Tracking with Ground Sensor Network')
+plt.grid(True)
 plt.legend()
-plt.title('Distributed Satellite Tracking with Consensus Kalman Filter')
-plt.grid()
+
+# Plot X position error over time
+plt.subplot(2, 2, 2)
+for i in range(num_sensors):
+    error_x = est_trajectories[i][:, 0] - true_trajectory[1:steps+1, 0]
+    plt.plot(range(steps), error_x, '--', label=f'Sensor {i+1}')
+error_x_consensus = consensus_trajectory[:, 0] - true_trajectory[1:steps+1, 0]
+plt.plot(range(steps), error_x_consensus, 'r-', linewidth=2, label='Consensus')
+plt.xlabel('Time step')
+plt.ylabel('X position error (km)')
+plt.title('X Position Estimation Error')
+plt.grid(True)
+plt.legend()
+
+# Plot Y position error over time
+plt.subplot(2, 2, 3)
+for i in range(num_sensors):
+    error_y = est_trajectories[i][:, 2] - true_trajectory[1:steps+1, 2]
+    plt.plot(range(steps), error_y, '--', label=f'Sensor {i+1}')
+error_y_consensus = consensus_trajectory[:, 2] - true_trajectory[1:steps+1, 2]
+plt.plot(range(steps), error_y_consensus, 'r-', linewidth=2, label='Consensus')
+plt.xlabel('Time step')
+plt.ylabel('Y position error (km)')
+plt.title('Y Position Estimation Error')
+plt.grid(True)
+plt.legend()
+
+# Plot velocity estimation
+plt.subplot(2, 2, 4)
+plt.plot(range(steps+1), np.sqrt(true_trajectory[:, 1]**2 + true_trajectory[:, 3]**2), 'k-', linewidth=2, label='True velocity')
+for i in range(num_sensors):
+    vel = np.sqrt(est_trajectories[i][:, 1]**2 + est_trajectories[i][:, 3]**2)
+    plt.plot(range(1, steps+1), vel, '--', label=f'Sensor {i+1}')
+vel_consensus = np.sqrt(consensus_trajectory[:, 1]**2 + consensus_trajectory[:, 3]**2)
+plt.plot(range(1, steps+1), vel_consensus, 'r-', linewidth=2, label='Consensus')
+plt.xlabel('Time step')
+plt.ylabel('Velocity (km/s)')
+plt.title('Target Velocity Estimation')
+plt.grid(True)
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+# 3D visualization
+fig = plt.figure(figsize=(10, 8))
+ax = fig.add_subplot(111, projection='3d')
+
+# Plot true trajectory
+ax.plot(true_trajectory[:, 0], true_trajectory[:, 2], [target_height] * len(true_trajectory), 'k-', linewidth=2, label='True trajectory')
+
+# Plot sensor positions
+for i, positions in enumerate(sensor_positions[0]):
+    marker = 'ro' if i == num_sensors - 1 else 'bo'
+    ax.plot([positions[0]], [positions[1]], [positions[2]], marker, markersize=8)
+    ax.text(positions[0], positions[1], positions[2], f'S{i+1}')
+
+# Plot consensus estimate
+ax.plot(consensus_trajectory[:, 0], consensus_trajectory[:, 2], [target_height] * len(consensus_trajectory), 'r-', linewidth=2, label='Consensus')
+
+ax.set_xlabel('X position (km)')
+ax.set_ylabel('Y position (km)')
+ax.set_zlabel('Z position (km)')
+ax.set_title('3D Visualization of Target Tracking')
+ax.legend()
+
+plt.tight_layout()
 plt.show()
 
