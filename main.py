@@ -74,7 +74,7 @@ def measurement_jacobian(x, sensor_pos):
 
 # Simulation parameters
 dt = 0.5  # Time step (s)
-steps = 100
+steps = 500
 omega = np.deg2rad(0.5)  # Turning rate (rad/s)
 target_height = 0.5  # km
 sensor_height = 0.2  # km
@@ -86,13 +86,14 @@ static_sensors = [
     [35, 10, sensor_height, 0, 0, 0],  # Scaled down from 3500, 1000
     [45, 10, sensor_height, 0, 0, 0]   # Scaled down from 4500, 1000
 ]
-mobile_sensor = [15, 0, sensor_height, 0.1, 0.2, 0]  # Scaled down from 1500, 0 with 10, 20 speed
+# Mobile sensor with constant velocity (straight path)
+mobile_sensor = [15, 10, sensor_height, 0.05, 0.05, 0]  # Scaled down from 1500, 0 with 10, 20 speed
 
 sensors = static_sensors + [mobile_sensor]
 num_sensors = len(sensors)
 
-# Initial target state [x, vx, y, vy]
-x0_true = np.array([20, 0, 100, 0])  # Scaled down from 2000, 10000
+# Initial target state [x, vx, y, vy] - moved closer to sensors
+x0_true = np.array([30, 0, 30, 0])  # Now starting much closer to the sensors
 
 # Process and measurement noise
 Q = 1e-5 * np.eye(4)  # Process noise covariance
@@ -114,8 +115,8 @@ for t in range(steps):
 true_trajectory = np.array(true_trajectory)
 
 # Initialize EKF for each sensor
-x_estimates = [np.array([20, 0.1, 100, 0.1]) for _ in range(num_sensors)]  # Initial guess
-P_estimates = [np.eye(4) * 10 for _ in range(num_sensors)]  # Initial covariance
+x_estimates = [np.array([30, 0.1, 30, 0.1]) for _ in range(num_sensors)]  # Updated initial guess
+P_estimates = [np.eye(4) * 10 for _ in range(num_sensors)]
 est_trajectories = [[] for _ in range(num_sensors)]
 measurements = [[] for _ in range(num_sensors)]
 
@@ -128,7 +129,7 @@ for t in range(steps + 1):
         if i == num_sensors - 1:  # Last sensor is mobile
             sensor[0] += sensor[3] * dt
             sensor[1] += sensor[4] * dt
-        current_positions.append(sensor[:3])  # Store x, y, z
+        current_positions.append(sensor[:3].copy())  # Store x, y, z (using copy to avoid reference issues)
     sensor_positions.append(current_positions)
 
 # Run EKF for each sensor
@@ -178,6 +179,9 @@ for t in range(steps):
     consensus_trajectory.append(consensus_state)
 consensus_trajectory = np.array(consensus_trajectory)
 
+# Extract mobile sensor path for visualization
+mobile_sensor_path = np.array([pos[num_sensors-1] for pos in sensor_positions])
+
 # Plotting the results
 plt.figure(figsize=(12, 8))
 
@@ -188,15 +192,13 @@ for i in range(num_sensors):
     plt.plot(est_trajectories[i][:, 0], est_trajectories[i][:, 2], '--', label=f'Sensor {i+1} estimate')
 plt.plot(consensus_trajectory[:, 0], consensus_trajectory[:, 2], 'r-', linewidth=2, label='Consensus estimate')
 
-# Plot sensor positions
-for t in [0, -1]:  # Plot initial and final positions
-    for i, pos in enumerate(sensor_positions[t]):
-        if i == num_sensors - 1:  # Mobile sensor
-            plt.plot(pos[0], pos[1], 'ro', markersize=8)
-            plt.text(pos[0], pos[1], f'Mobile {t}')
-        else:
-            plt.plot(pos[0], pos[1], 'bo', markersize=8)
-            plt.text(pos[0], pos[1], f'S{i+1}')
+# Plot static sensor positions
+for i, pos in enumerate(sensor_positions[0][:-1]):  # Exclude mobile sensor
+    plt.plot(pos[0], pos[1], 'bo', markersize=8)
+    plt.text(pos[0], pos[1], f'S{i+1}')
+
+# Plot mobile sensor path as a clean, straight line
+plt.plot(mobile_sensor_path[:, 0], mobile_sensor_path[:, 1], 'g-', linewidth=2, label='Mobile sensor path')
 
 plt.xlabel('X position (km)')
 plt.ylabel('Y position (km)')
@@ -248,26 +250,42 @@ plt.tight_layout()
 plt.show()
 
 # 3D visualization
-fig = plt.figure(figsize=(10, 8))
+fig = plt.figure(figsize=(12, 10))
 ax = fig.add_subplot(111, projection='3d')
 
 # Plot true trajectory
 ax.plot(true_trajectory[:, 0], true_trajectory[:, 2], [target_height] * len(true_trajectory), 'k-', linewidth=2, label='True trajectory')
 
-# Plot sensor positions
-for i, positions in enumerate(sensor_positions[0]):
-    marker = 'ro' if i == num_sensors - 1 else 'bo'
-    ax.plot([positions[0]], [positions[1]], [positions[2]], marker, markersize=8)
-    ax.text(positions[0], positions[1], positions[2], f'S{i+1}')
+# Plot static sensor positions
+for i, pos in enumerate(sensor_positions[0][:-1]):  # Exclude mobile sensor
+    ax.scatter(pos[0], pos[1], pos[2], c='blue', marker='o', s=100)
+    ax.text(pos[0], pos[1], pos[2], f'S{i+1}')
+
+# Plot mobile sensor path as a clean, straight line without annotations
+ax.plot(mobile_sensor_path[:, 0], mobile_sensor_path[:, 1], mobile_sensor_path[:, 2], 'g-', linewidth=2, label='Mobile sensor path')
 
 # Plot consensus estimate
 ax.plot(consensus_trajectory[:, 0], consensus_trajectory[:, 2], [target_height] * len(consensus_trajectory), 'r-', linewidth=2, label='Consensus')
 
+# Add measurement lines from sensors to target at select time points
+visualization_times = [0, steps//2, steps-1]  # Fewer measurement lines for clarity
+for t in visualization_times:
+    for i in range(num_sensors):
+        if t < len(true_trajectory):  # Ensure t is valid
+            sensor_pos = sensor_positions[t][i]
+            target_pos = [true_trajectory[t][0], true_trajectory[t][2], target_height]
+            ax.plot([sensor_pos[0], target_pos[0]], 
+                    [sensor_pos[1], target_pos[1]],
+                    [sensor_pos[2], target_pos[2]], 'k:', alpha=0.3)
+
 ax.set_xlabel('X position (km)')
 ax.set_ylabel('Y position (km)')
 ax.set_zlabel('Z position (km)')
-ax.set_title('3D Visualization of Target Tracking')
+ax.set_title('3D Visualization of Target Tracking with Mobile Sensor')
 ax.legend()
+
+# Set reasonable z-axis limits to better show height differences
+ax.set_zlim(0, 1)
 
 plt.tight_layout()
 plt.show()
