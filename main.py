@@ -23,7 +23,7 @@ class Target:
         self.velocities = {
             'descent': np.array([0, -60]),  # Straight down at 60 units/s
             'turn1': np.array([20, -15]),   # Right turn with slight descent
-            'turn2': np.array([10, -25])    # Final maneuver
+            'turn2': np.array([0, -25])    # Final maneuver
         }
         self.phase = 'descent'
         
@@ -312,5 +312,109 @@ def run_simulation():
     plt.legend()
     plt.show()
 
+def run_monte_carlo_simulation(n_runs: int = 100):
+    # Storage for Monte Carlo results
+    rmse_histories = []
+    
+    for run in range(n_runs):
+        # Initialize simulation parameters
+        dt = 0.5  # Time step (0.5s as per paper)
+        sim_time = 500  # Total simulation time
+        n_steps = int(sim_time/dt)
+        
+        # Initialize nodes with exact positions from paper
+        nodes = [
+            Node(np.array([2500, 1000])),  # Static node 1
+            Node(np.array([3500, 1000])),  # Static node 2
+            Node(np.array([4500, 1000])),  # Static node 3
+            Node(np.array([1500, 0]), np.array([10, 20]), True)  # Mobile node with 10km/s X, 20km/s Y
+        ]
+        
+        # Initialize target with exact initial state
+        target = Target(np.array([2000, 0, 10000, 0]))
+        
+        # Initialize CSTACKF with parameters from paper
+        consensus_weights = np.array([
+            [1/2, 1/3, 1/4, 0],
+            [1/3, 5/12, 1/4, 0],
+            [1/4, 1/4, 1/4, 1/4],
+            [0, 0, 1/4, 3/4]
+        ])
+        
+        Q = 1e-5 * np.eye(4)  # Process noise covariance as per paper
+        R = np.eye(3)  # Measurement noise covariance
+        
+        filter = CSTACKF(nodes, consensus_weights, Q, R)
+        
+        # Initialize state estimates and covariances
+        x_estimates = [np.array([2000, 0, 10000, 0]) for _ in range(len(nodes))]
+        P_estimates = [100 * np.eye(4) for _ in range(len(nodes))]
+        
+        # Storage for this run
+        rmse_history = []
+        
+        # Simulation loop
+        for k in range(n_steps):
+            # Update target and node positions
+            target.update(dt)
+            
+            for i, node in enumerate(nodes):
+                node.update_position(dt)
+                
+                # Get measurement
+                z = filter.get_measurement(target, node)
+                
+                # Local filter update
+                x_pred, P_pred = filter.predict(x_estimates[i], P_estimates[i])
+                x_estimates[i], P_estimates[i] = filter.update(x_pred, P_pred, z, i)
+            
+            # Consensus step
+            x_estimates, P_estimates = filter.consensus_step(x_estimates, P_estimates)
+            
+            # Calculate RMSE for this timestep
+            rmse = np.sqrt(np.mean([(x_estimates[i][0] - target.state[0])**2 + 
+                                   (x_estimates[i][2] - target.state[2])**2 
+                                   for i in range(len(nodes))]))
+            rmse_history.append(rmse)
+        
+        rmse_histories.append(rmse_history)
+    
+    # Calculate average RMSE across all runs
+    avg_rmse = np.mean(rmse_histories, axis=0)
+    std_rmse = np.std(rmse_histories, axis=0)
+    
+    # Plot averaged results
+    plt.figure(figsize=(10, 6))
+    time = np.arange(n_steps) * dt
+    plt.plot(time, avg_rmse, 'b-', label='CSTA-CKF')
+    plt.fill_between(time, avg_rmse - std_rmse, avg_rmse + std_rmse, alpha=0.2)
+    plt.xlabel('Time (s)')
+    plt.ylabel('RMSE (km)')
+    plt.title('Average RMSE over {} Monte Carlo Runs'.format(n_runs))
+    plt.grid(True)
+    plt.legend()
+    plt.show()
+    
+    # Also plot azimuth angles as in paper Fig. 6
+    plt.figure(figsize=(10, 6))
+    for i in range(4):
+        azimuth_history = []
+        node = nodes[i]
+        for k in range(n_steps):
+            dx = target.state[0] - node.position[0]
+            dy = target.state[2] - node.position[1]
+            azimuth = np.degrees(np.arctan2(dy, dx))
+            azimuth_history.append(azimuth)
+        plt.plot(time, azimuth_history, label=f'Sensor {i+1}')
+    
+    plt.xlabel('Time (s)')
+    plt.ylabel('Azimuth Angle (degrees)')
+    plt.title('Azimuth Angles Measured by Sensors')
+    plt.grid(True)
+    plt.legend()
+    plt.show()
+
 if __name__ == "__main__":
+    # Run both single simulation and Monte Carlo analysis
     run_simulation()
+    run_monte_carlo_simulation(100)  # 100 runs as per paper
