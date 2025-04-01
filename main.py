@@ -1,9 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-import numpy as np
-import matplotlib.pyplot as plt
-
 # Satellite dynamics: constant velocity model
 def simulate_satellite_motion(x0, F, steps, Q):
     x = x0
@@ -11,14 +8,11 @@ def simulate_satellite_motion(x0, F, steps, Q):
     for _ in range(steps):
         w = np.random.multivariate_normal(np.zeros(len(Q)), Q)
         x = F @ x + w
-       
-
-
 
 # Simulation parameters
 dt = 1.0
 steps = 50
-num_stations = 3
+num_stations = 5
 
 # State vector: [x, y, vx, vy]
 x0 = np.array([0, 0, 1, 0.5])
@@ -67,16 +61,28 @@ for t in range(steps):
 
         est_trajectories[i].append(x_estimates[i][:2])
 
+# Calculate consensus estimate by averaging all station estimates
+consensus_trajectory = []
+for t in range(steps):
+    consensus_state = np.zeros(2)
+    for i in range(num_stations):
+        consensus_state += est_trajectories[i][t]
+    consensus_state /= num_stations
+    consensus_trajectory.append(consensus_state)
+consensus_trajectory = np.array(consensus_trajectory)
+
 # Plotting
 plt.figure(figsize=(10, 6))
 plt.plot(true_trajectory[:, 0], true_trajectory[:, 1], 'k-', label='True trajectory')
 for i in range(num_stations):
     est = np.array(est_trajectories[i])
     plt.plot(est[:, 0], est[:, 1], '--', label=f'Station {i+1} estimate')
+# Add consensus estimate to plot
+plt.plot(consensus_trajectory[:, 0], consensus_trajectory[:, 1], 'r-', linewidth=2, label='Consensus estimate')
 plt.xlabel('X position')
 plt.ylabel('Y position')
 plt.legend()
-plt.title('Distributed Satellite Tracking with KF')
+plt.title('Distributed Satellite Tracking with Consensus Kalman Filter')
 plt.grid()
 plt.show()
 
