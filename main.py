@@ -52,10 +52,12 @@ class CSTACKF:
         self.n_nodes = len(nodes)
         self.state_dim = 4
         self.rho = 0.95  # Forgetting factor
-        self.beta = 1.1  # Weakening factor
+        self.beta = 2.0  # Increased for better maneuver tracking
+        self.consensus_iterations = 3
+        self.measurement_noise = 0.01  # Added measurement noise
         self.V_prev = None  # Previous measurement residual covariance
         
-    def get_measurement(self, target: Target, node: Node) -> Tuple[np.ndarray, np.ndarray]:
+    def get_measurement(self, target: Target, node: Node) -> np.ndarray:
         dx = target.state[0] - node.position[0]
         dy = target.state[2] - node.position[1]
         dh = 0.3  # Height difference between target and sensor
@@ -67,7 +69,10 @@ class CSTACKF:
         # Elevation
         theta = atan2(dh, sqrt(dx**2 + dy**2 + dh**2))
         
-        return np.array([r, psi, theta])
+        z = np.array([r, psi, theta])
+        noise = np.random.normal(0, self.measurement_noise, size=3)
+        noise[0] *= 100  # Range noise larger than angle noise
+        return z + noise
 
     def generate_cubature_points(self, x: np.ndarray, P: np.ndarray) -> Tuple[np.ndarray, List[np.ndarray]]:
         n = x.shape[0]
@@ -83,24 +88,35 @@ class CSTACKF:
         return np.array(xi_points)
 
     def predict(self, x: np.ndarray, P: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        dt = 0.5
+        # Proper state transition matrix for CV model with explicit float64 type
+        F = np.array([
+            [1, dt, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, dt],
+            [0, 0, 0, 1]
+        ], dtype=np.float64)
+        
         # Get cubature points
         cubature_points = self.generate_cubature_points(x, P)
         
-        # Propagate points through state model (constant velocity model)
+        # Propagate through state model
         propagated_points = []
         for point in cubature_points:
-            propagated_points.append(point)  # Apply state transition
+            prop_point = F @ point
+            propagated_points.append(prop_point)
             
-        propagated_points = np.array(propagated_points)
+        propagated_points = np.array(propagated_points, dtype=np.float64)
         
         # Calculate predicted state and covariance
         x_pred = np.mean(propagated_points, axis=0)
-        P_pred = np.zeros_like(P)
+        P_pred = np.zeros_like(P, dtype=np.float64)  # Explicit float64 type
         
         for point in propagated_points:
-            P_pred += np.outer(point - x_pred, point - x_pred)
+            diff = point - x_pred
+            P_pred += np.outer(diff, diff)
+            
         P_pred = P_pred / len(propagated_points) + self.Q
-        
         return x_pred, P_pred
 
     def measurement_function(self, state: np.ndarray, node_position: np.ndarray = np.array([0, 0])) -> np.ndarray:
@@ -145,48 +161,68 @@ class CSTACKF:
         Pzz = Pzz / len(z_points)
         Pxz = Pxz / len(z_points)
         
-        # Calculate suboptimal fading factor
-        gamma = z - z_pred
+        # Improved innovation handling
+        innovation = z - z_pred
+        # Wrap angle innovations to [-pi, pi]
+        innovation[1:] = np.arctan2(np.sin(innovation[1:]), np.cos(innovation[1:]))
+        
+        innovation_cov = np.outer(innovation, innovation)
+        
         if self.V_prev is None:
-            V = np.outer(gamma, gamma)
+            V = innovation_cov
         else:
-            V = (self.rho * self.V_prev + np.outer(gamma, gamma)) / (1 + self.rho)
-            
-        H = Pxz.T @ np.linalg.inv(P)  # Changed from Pzz to match dimensions
+            V = (self.rho * self.V_prev + innovation_cov) / (1 + self.rho)
+        
+        # More stable matrix calculations
+        H = Pxz.T @ np.linalg.pinv(P + 1e-6 * np.eye(P.shape[0]))
         N = V - H @ self.Q @ H.T - self.beta * self.R
         M = Pzz - V + N + (self.beta - 1) * self.R
         
-        lambda_k = max(1, np.trace(N) / np.trace(M))
+        # Improved fading factor
+        lambda_k = max(1, np.clip(np.trace(N) / (np.trace(M) + 1e-6), 1, 3))
         
-        # Calculate adaptive factor
-        mu_k = (np.trace(np.outer(gamma, gamma)) - np.trace(Pzz)) / np.trace(self.R)
-        mu_k = max(1, mu_k)
+        # Better adaptive factor
+        S = innovation_cov - Pzz
+        mu_k = max(1, np.clip(np.trace(S) / (np.trace(self.R) + 1e-6), 1, 5))
         
-        # Update state estimate
-        Pzz += mu_k * self.R  # Add adaptive measurement noise
-        K = Pxz @ np.linalg.inv(Pzz)
+        # Stabilized update
+        R_adapted = mu_k * self.R
+        Pzz_stable = Pzz + R_adapted + 1e-6 * np.eye(3)
+        K = Pxz @ np.linalg.pinv(Pzz_stable)
         
-        x_updated = x + K @ (z - z_pred)
-        P_updated = lambda_k * (P - K @ Pzz @ K.T)
+        x_updated = x + K @ innovation
+        P_updated = lambda_k * (P - K @ Pzz_stable @ K.T)
         
+        # Ensure symmetric and positive definite
+        P_updated = (P_updated + P_updated.T) / 2
+        min_eig = np.min(np.real(np.linalg.eigvals(P_updated)))
+        if min_eig < 1e-6:
+            P_updated += (1e-6 - min_eig) * np.eye(P_updated.shape[0])
+            
         self.V_prev = V
-        
         return x_updated, P_updated
 
     def consensus_step(self, states: List[np.ndarray], covs: List[np.ndarray]) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-        new_states = []
-        new_covs = []
+        new_states = states.copy()
+        new_covs = covs.copy()
         
-        for i in range(self.n_nodes):
-            state_i = np.zeros_like(states[0])
-            cov_i = np.zeros_like(covs[0])
+        for _ in range(self.consensus_iterations):
+            updated_states = []
+            updated_covs = []
             
-            for j in range(self.n_nodes):
-                state_i += self.weights[i,j] * states[j]
-                cov_i += self.weights[i,j] * covs[j]
+            for i in range(self.n_nodes):
+                state_i = np.zeros_like(states[0])
+                cov_i = np.zeros_like(covs[0])
                 
-            new_states.append(state_i)
-            new_covs.append(cov_i)
+                for j in range(self.n_nodes):
+                    state_i += self.weights[i,j] * new_states[j]
+                    cov_i += self.weights[i,j] * new_covs[j]
+                    
+                updated_states.append(state_i)
+                updated_covs.append(cov_i)
+            
+            new_states = updated_states
+            new_covs = updated_covs
             
         return new_states, new_covs
 
@@ -215,14 +251,15 @@ def run_simulation():
         [0, 0, 1/4, 3/4]
     ])
     
-    Q = 1e-5 * np.eye(4)  # Process noise covariance
-    R = np.eye(3)  # Measurement noise covariance
+    # Initialize with explicit float64 type
+    Q = 1e-3 * np.diag([0.1, 1, 0.1, 1]).astype(np.float64)
+    R = np.diag([100, 0.01, 0.01]).astype(np.float64)
     
     filter = CSTACKF(nodes, consensus_weights, Q, R)
     
     # Initialize state estimates and covariances for each node
-    x_estimates = [np.array([2000, 0, 10000, 0]) for _ in range(len(nodes))]
-    P_estimates = [100 * np.eye(4) for _ in range(len(nodes))]
+    x_estimates = [np.array([2000, 0, 10000, 0], dtype=np.float64) for _ in range(len(nodes))]
+    P_estimates = [np.diag([1000, 10, 1000, 10]).astype(np.float64) for _ in range(len(nodes))]
     
     # Storage for trajectories and errors
     target_trajectory = []
@@ -341,14 +378,14 @@ def run_monte_carlo_simulation(n_runs: int = 100):
             [0, 0, 1/4, 3/4]
         ])
         
-        Q = 1e-5 * np.eye(4)  # Process noise covariance as per paper
-        R = np.eye(3)  # Measurement noise covariance
+        Q = 1e-3 * np.diag([0.1, 1, 0.1, 1])  # More process noise on velocities
+        R = np.diag([100, 0.01, 0.01])  # Realistic measurement noise
         
         filter = CSTACKF(nodes, consensus_weights, Q, R)
         
         # Initialize state estimates and covariances
-        x_estimates = [np.array([2000, 0, 10000, 0]) for _ in range(len(nodes))]
-        P_estimates = [100 * np.eye(4) for _ in range(len(nodes))]
+        x_estimates = [np.array([2000, 0, 10000, 0], dtype=np.float64) for _ in range(len(nodes))]
+        P_estimates = [np.diag([1000, 10, 1000, 10]).astype(np.float64) for _ in range(len(nodes))]
         
         # Storage for this run
         rmse_history = []
