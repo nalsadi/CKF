@@ -269,3 +269,25 @@ plt.title('Comparison of State 0 for Each Node')
 plt.legend()
 plt.grid(True)
 plt.show()
+
+# Calculate RMSE at each time step for each method
+rmse_lstm_per_t = torch.sqrt(torch.mean((x - torch.mean(x_kf, dim=2))**2, dim=0))  # Mean over states, average across nodes
+rmse_regular_per_t = torch.sqrt(torch.mean((x - torch.mean(x_kf_reg, dim=2))**2, dim=0))  # Mean over states, average across nodes
+
+# Plot RMSE over time for each method
+plt.figure(figsize=(12, 6))
+plt.plot(t, rmse_lstm_per_t.cpu().detach().numpy(), label='LSTM-EKF RMSE', linestyle='--', linewidth=2)
+plt.plot(t, rmse_regular_per_t.cpu().detach().numpy(), label='Regular EKF RMSE', linestyle=':', linewidth=2)
+plt.xlabel('Time (sec)')
+plt.ylabel('RMSE')
+plt.title('RMSE Over Time for Each Method')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Print the final RMSE difference between the two methods
+final_rmse_lstm = torch.mean(rmse_lstm_per_t).item()
+final_rmse_regular = torch.mean(rmse_regular_per_t).item()
+print(f"Final RMSE (LSTM-EKF): {final_rmse_lstm:.6f}")
+print(f"Final RMSE (Regular EKF): {final_rmse_regular:.6f}")
+print(f"Difference in RMSE: {abs(final_rmse_lstm - final_rmse_regular):.6f}")
