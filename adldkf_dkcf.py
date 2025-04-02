@@ -10,8 +10,6 @@ seed = 42  # You can choose any integer value
 np.random.seed(seed)
 torch.manual_seed(seed)
 
-
-
 # Simulation parameters
 tf = 200  # Final time in simulation (seconds)
 dt = 0.7  # Sample rate (seconds)
@@ -226,6 +224,15 @@ for node in range(num_nodes):
     x_kf[:, 0, node] = torch.tensor(x0_true, dtype=torch.float32, device=device) + torch.randn(n, device=device) * 0.1
     dkcf_states[node, 0, :] = torch.tensor(x0_true, dtype=torch.float32, device=device) + torch.randn(n, device=device) * 0.1
 
+# Initialize STACKF variables
+stackf_states = torch.zeros((num_nodes, len(t), n), dtype=torch.float32, device=device)
+stackf_P = [torch.eye(n, dtype=torch.float32, device=device) for _ in range(num_nodes)]
+squared_error_stackf = torch.zeros((n, len(t), num_nodes), dtype=torch.float32, device=device)
+
+# Initialize STACKF with the same initial state
+for node in range(num_nodes):
+    stackf_states[node, 0, :] = torch.tensor(x0_true, dtype=torch.float32, device=device) + torch.randn(n, device=device) * 0.1
+
 # Kalman Filter functions
 def kf_predict(x, u, P, Q, dt):
     # Predict satellite state using motion model
@@ -307,6 +314,49 @@ def ssf_update(x_pred, z, P_pred, R, sensor_pos, delta):
     
     return x_updated, P_updated, z_pred
 
+def stackf_update(x_pred, P_pred, z, R, Q, sensor_pos, lambda_k=1.0, mu_k=1.0):
+    """
+    Consensus-Based STACKF Algorithm
+    """
+    n = x_pred.shape[-1]
+    m = z.shape[-1]
+    
+    # Generate cubature points
+    points_num = 2 * n
+    L = torch.linalg.cholesky(P_pred + torch.eye(n, device=device) * 1e-6)
+    xi_points = torch.zeros((points_num, n), device=device)
+    for i in range(n):
+        xi_points[2*i] = x_pred + torch.sqrt(torch.tensor(n, device=device)) * L[:, i]
+        xi_points[2*i + 1] = x_pred - torch.sqrt(torch.tensor(n, device=device)) * L[:, i]
+    
+    # Transform points through measurement model
+    z_points = torch.stack([measurement_model(xi.unsqueeze(0), sensor_pos) for xi in xi_points])
+    
+    # Calculate mean and covariance
+    z_pred = torch.mean(z_points, dim=0)
+    Pzz = torch.zeros((m, m), device=device)
+    Pxz = torch.zeros((n, m), device=device)
+    
+    for i in range(points_num):
+        z_diff = (z_points[i] - z_pred).view(-1, 1)  # Reshape to column vector
+        x_diff = (xi_points[i] - x_pred).view(-1, 1)  # Reshape to column vector
+        Pzz += z_diff @ z_diff.T  # Matrix multiplication for covariance
+        Pxz += x_diff @ z_diff.T  # Matrix multiplication for cross-covariance
+    
+    # Apply adaptive factor
+    Pzz = lambda_k * (Pzz / points_num) + mu_k * R
+    Pxz = Pxz / points_num
+    
+    # Kalman gain
+    K = Pxz @ torch.linalg.pinv(Pzz)
+    
+    # Update state and covariance
+    innovation = (z - z_pred).view(-1)  # Reshape to 1D tensor
+    innovation[1:3] = torch.atan2(torch.sin(innovation[1:3]), torch.cos(innovation[1:3]))
+    x_updated = x_pred + K @ innovation
+    P_updated = P_pred - K @ Pzz @ K.T + Q  # Use .T for matrix transpose
+    
+    return x_updated, P_updated, z_pred
 
 # Generate true satellite trajectory
 for k in range(1, len(t)):
@@ -437,19 +487,39 @@ for k in range(1, len(t)):
         dkcf_states[i, k, :] = x_i + c * (mean_state - x_i)
         squared_error_dkcf[:, k, i] = (x[:, k] - dkcf_states[i, k, :])**2
 
+    # ----- STACKF -----
+    for node in range(num_nodes):
+        sensor_pos = sensor_positions_torch[k][node]
+        z_node = z[:, k, node]
+        
+        x_pred = satellite_motion_model(stackf_states[node, k-1, :], dt)
+        x_updated, P_updated, _ = stackf_update(x_pred, stackf_P[node], z_node, R_list[node], Q, sensor_pos)
+        stackf_states[node, k, :] = x_updated
+        stackf_P[node] = P_updated
+    
+    # Consensus step for STACKF
+    mean_state = torch.mean(stackf_states[:, k, :], dim=0)  # Mean across all nodes
+    for node in range(num_nodes):
+        x_i = stackf_states[node, k, :]
+        stackf_states[node, k, :] = x_i + c * (mean_state - x_i)
+        squared_error_stackf[:, k, node] = (x[:, k] - stackf_states[node, k, :])**2
+
 
 # Compute RMSE per state over time (using consensus states)
 rmse_adldkf_state = torch.sqrt(torch.mean(squared_error_kf, dim=(0, 2)))  # Mean across states and nodes
 rmse_dkcf_state = torch.sqrt(torch.mean(squared_error_dkcf, dim=(0, 2)))  # Mean across states and nodes
+rmse_stackf_state = torch.sqrt(torch.mean(squared_error_stackf, dim=(0, 2)))  # Mean across states and nodes
 
 # Compute total RMSE over time (using consensus states)
 rmse_adldkf_total = torch.sqrt(torch.sum(torch.mean(squared_error_kf, dim=2), dim=0))
 rmse_dkcf_total = torch.sqrt(torch.sum(torch.mean(squared_error_dkcf, dim=2), dim=0))
+rmse_stackf_total = torch.sqrt(torch.sum(torch.mean(squared_error_stackf, dim=2), dim=0))
 
 # Convert to numpy for plotting (use mean states across nodes)
 x_np = x.cpu().detach().numpy()
 x_kf_mean = torch.mean(x_kf, dim=2).cpu().detach().numpy()  # Mean across nodes
 dkcf_mean = torch.mean(dkcf_states, dim=0).cpu().detach().numpy()  # Mean across nodes
+stackf_mean = torch.mean(stackf_states, dim=0).cpu().detach().numpy()  # Mean across nodes
 
 # Create figure with 3 rows and 2 columns
 plt.figure(figsize=(15, 12))
@@ -459,6 +529,7 @@ plt.subplot(3, 2, 1)
 plt.plot(x_np[0, 1:], x_np[2, 1:], 'k-', label='True', linewidth=2)
 plt.plot(x_kf_mean[0, 1:], x_kf_mean[2, 1:], 'r--', label='ADL-DKF', linewidth=1.5)
 plt.plot(dkcf_mean[1:, 0], dkcf_mean[1:, 2], 'g-.', label='DKCF', linewidth=1.5)
+plt.plot(stackf_mean[1:, 0], stackf_mean[1:, 2], 'y-.', label='STACKF', linewidth=1.5)
 plt.xlabel('X Position (km)')
 plt.ylabel('Y Position (km)')
 plt.title('Satellite Trajectory')
@@ -469,6 +540,7 @@ plt.grid(True)
 plt.subplot(3, 2, 2)
 plt.plot(t[1:], x_np[0, 1:] - x_kf_mean[0, 1:], 'r--', label='ADL-DKF')
 plt.plot(t[1:], x_np[0, 1:] - dkcf_mean[1:, 0], 'g-.', label='DKCF')
+plt.plot(t[1:], x_np[0, 1:] - stackf_mean[1:, 0], 'y-.', label='STACKF')
 plt.xlabel('Time (sec)')
 plt.ylabel('X Position Error (km)')
 plt.title('X Position Error')
@@ -479,6 +551,7 @@ plt.grid(True)
 plt.subplot(3, 2, 3)
 plt.plot(t[1:], x_np[2, 1:] - x_kf_mean[2, 1:], 'r--', label='ADL-DKF')
 plt.plot(t[1:], x_np[2, 1:] - dkcf_mean[1:, 2], 'g-.', label='DKCF')
+plt.plot(t[1:], x_np[2, 1:] - stackf_mean[1:, 2], 'y-.', label='STACKF')
 plt.xlabel('Time (sec)')
 plt.ylabel('Y Position Error (km)')
 plt.title('Y Position Error')
@@ -491,8 +564,10 @@ true_vel = np.sqrt(x_np[1, :]**2 + x_np[3, :]**2)
 plt.plot(t, true_vel, 'k-', label='True Velocity', linewidth=2)
 adldkf_vel = np.sqrt(x_kf_mean[1, :]**2 + x_kf_mean[3, :]**2)
 dkcf_vel = np.sqrt(dkcf_mean[:, 1]**2 + dkcf_mean[:, 3]**2)
+stackf_vel = np.sqrt(stackf_mean[:, 1]**2 + stackf_mean[:, 3]**2)
 plt.plot(t, adldkf_vel, 'r--', label='ADL-DKF')
 plt.plot(t, dkcf_vel, 'g-.', label='DKCF')
+plt.plot(t, stackf_vel, 'y-.', label='STACKF')
 plt.xlabel('Time (sec)')
 plt.ylabel('Velocity (km/s)')
 plt.title('Velocity Estimation')
@@ -503,6 +578,7 @@ plt.grid(True)
 plt.subplot(3, 2, 5)
 plt.plot(t[1:], rmse_adldkf_total[1:].cpu().detach().numpy(), 'r-', label='ADL-DKF')
 plt.plot(t[1:], rmse_dkcf_total[1:].cpu().detach().numpy(), 'g-', label='DKCF')
+plt.plot(t[1:], rmse_stackf_total[1:].cpu().detach().numpy(), 'y-', label='STACKF')
 plt.xlabel('Time (sec)')
 plt.ylabel('Total RMSE')
 plt.title('Total RMSE Over Time')
@@ -513,6 +589,7 @@ plt.grid(True)
 plt.subplot(3, 2, 6)
 plt.plot(t[1:], rmse_adldkf_state[1:].cpu().detach().numpy(), 'r-', label='ADL-DKF')
 plt.plot(t[1:], rmse_dkcf_state[1:].cpu().detach().numpy(), 'g-', label='DKCF')
+plt.plot(t[1:], rmse_stackf_state[1:].cpu().detach().numpy(), 'y-', label='STACKF')
 plt.xlabel('Time (sec)')
 plt.ylabel('Mean RMSE')
 plt.title('Mean RMSE Over Time')
@@ -551,6 +628,9 @@ ax.plot(x_kf_mean[0, :], x_kf_mean[2, :], target_height, 'g-.', label='ADL-DKF E
 # Plot DKCF estimated trajectory
 ax.plot(dkcf_mean[:, 0], dkcf_mean[:, 2], target_height, 'm-.', label='DKCF Estimated Trajectory', linewidth=1.5)
 
+# Plot STACKF estimated trajectory
+ax.plot(stackf_mean[:, 0], stackf_mean[:, 2], target_height, 'y-.', label='STACKF Estimated Trajectory', linewidth=1.5)
+
 # Set labels and title
 ax.set_xlabel('X Position (km)')
 ax.set_ylabel('Y Position (km)')
@@ -566,19 +646,22 @@ plt.show()
 # Compute overall RMSE properly considering all dimensions
 rmse_adldkf = torch.sqrt(torch.mean(squared_error_kf[:, 1:, :]))  # Mean across states, time, nodes
 rmse_dkcf = torch.sqrt(torch.mean(squared_error_dkcf[:, 1:, :]))  # Mean across states, time, nodes
+rmse_stackf = torch.sqrt(torch.mean(squared_error_stackf[:, 1:, :]))  # Mean across states, time, nodes
 
 print("\nOverall Mean RMSE:")
 print(f"ADL-DKF: {rmse_adldkf.item():.6f}")
 print(f"DKCF: {rmse_dkcf.item():.6f}")
+print(f"STACKF: {rmse_stackf.item():.6f}")
 
 # Also print state-wise RMSE
 state_rmse_adldkf = torch.sqrt(torch.mean(squared_error_kf[:, 1:, :], dim=(1, 2)))  # Per state RMSE
 state_rmse_dkcf = torch.sqrt(torch.mean(squared_error_dkcf[:, 1:, :], dim=(1, 2)))  # Per state RMSE
+state_rmse_stackf = torch.sqrt(torch.mean(squared_error_stackf[:, 1:, :], dim=(1, 2)))  # Per state RMSE
 
 print("\nState-wise RMSE:")
 states = ['x', 'vx', 'y', 'vy']
 for i, state in enumerate(states):
-    print(f"{state:<3} - ADL-DKF: {state_rmse_adldkf[i].item():.6f}, DKCF: {state_rmse_dkcf[i].item():.6f}")
+    print(f"{state:<3} - ADL-DKF: {state_rmse_adldkf[i].item():.6f}, DKCF: {state_rmse_dkcf[i].item():.6f}, STACKF: {state_rmse_stackf[i].item():.6f}")
 
 # Print additional information about the fault
 print("\nFault Information:")
@@ -592,15 +675,19 @@ print("\nRMSE Before Fault:")
 pre_fault_idx = slice(1, len(t)//2)
 rmse_adldkf_pre = torch.sqrt(torch.mean(squared_error_kf[:, pre_fault_idx, :]))
 rmse_dkcf_pre = torch.sqrt(torch.mean(squared_error_dkcf[:, pre_fault_idx, :]))
+rmse_stackf_pre = torch.sqrt(torch.mean(squared_error_stackf[:, pre_fault_idx, :]))
 print(f"ADL-DKF: {rmse_adldkf_pre.item():.6f}")
 print(f"DKCF: {rmse_dkcf_pre.item():.6f}")
+print(f"STACKF: {rmse_stackf_pre.item():.6f}")
 
 print("\nRMSE After Fault:")
 post_fault_idx = slice(len(t)//2, len(t))
 rmse_adldkf_post = torch.sqrt(torch.mean(squared_error_kf[:, post_fault_idx, :]))
 rmse_dkcf_post = torch.sqrt(torch.mean(squared_error_dkcf[:, post_fault_idx, :]))
+rmse_stackf_post = torch.sqrt(torch.mean(squared_error_stackf[:, post_fault_idx, :]))
 print(f"ADL-DKF: {rmse_adldkf_post.item():.6f}")
 print(f"DKCF: {rmse_dkcf_post.item():.6f}")
+print(f"STACKF: {rmse_stackf_post.item():.6f}")
 
 # Calculate adaptation time (how long it takes ADL-DKF to re-achieve pre-fault performance)
 # This is approximate - we look for when the RMSE returns to within 20% of pre-fault levels
