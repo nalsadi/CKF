@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
 # Simulation parameters
-tf = 100  # Final time in simulation (seconds)
+tf = 200  # Final time in simulation (seconds)
 dt = 0.7  # Sample rate (seconds)
 t = np.arange(0, tf + dt, dt)  # Time vector
 n = 4  # Number of states [x, vx, y, vy]
@@ -167,11 +167,11 @@ for _ in range(num_nodes):
     # Change output_dim to n + m + 1 to include Q diag, R diag, and delta
     model = LSTMEstimator(input_dim=m, hidden_dim=32, output_dim=n+m+1).to(device)
     lstm_models.append(model)
-    optimizers.append(optim.Adam(model.parameters(), lr=1e-1 / 2))
+    optimizers.append(optim.Adam(model.parameters(), lr=1e-3))
     criterions.append(nn.MSELoss())
 
 # Define the sliding window size
-window_size = 10
+window_size = 30
 
 # Initialize measurement history for each node
 z_node_histories = [torch.zeros((m, window_size), dtype=torch.float32, device=device) for _ in range(num_nodes)]
@@ -292,8 +292,22 @@ def ssf_update(x_pred, z, P_pred, R, sensor_pos, delta):
 
 # Generate true satellite trajectory
 for k in range(1, len(t)):
-    # True system dynamics
-    x[:, k] = satellite_motion_model(x[:, k-1].unsqueeze(0), dt).squeeze(0) + w[:, k]
+    # Check for fault condition - occurs halfway through simulation
+    fault_time_index = len(t) // 2
+    is_fault_active = k >= fault_time_index
+    
+    # True system dynamics with fault
+    if is_fault_active:
+        # System fault: Add bias to acceleration and introduce unexpected trajectory change
+        # This simulates a thruster malfunction or unexpected gravitational disturbance
+        fault_bias = torch.tensor([0.05, 0.003, -0.04, 0.002], dtype=torch.float32, device=device)
+        fault_process_noise_multiplier = 5.0  # 5x more process noise during fault
+        
+        # Apply model with fault
+        x[:, k] = satellite_motion_model(x[:, k-1].unsqueeze(0), dt).squeeze(0) + fault_bias + w[:, k] * fault_process_noise_multiplier
+    else:
+        # Normal dynamics
+        x[:, k] = satellite_motion_model(x[:, k-1].unsqueeze(0), dt).squeeze(0) + w[:, k]
     
     # Generate measurements for each sensor
     for node in range(num_nodes):
@@ -305,11 +319,15 @@ for k in range(1, len(t)):
         v = torch.tensor(np.random.multivariate_normal(
             mean=np.zeros(m), cov=node_cov), 
             dtype=torch.float32, device=device)
+        
         z[:, k, node] = true_measurement + v
 
 
 # Simulation loop
 for k in range(1, len(t)):
+    # Check for fault condition
+    fault_time_index = len(t) // 2
+    is_fault_active = k >= fault_time_index
     
     # ----- ADL-DKF -----
     # First update individual node estimates
@@ -327,7 +345,10 @@ for k in range(1, len(t)):
             lstm_model = lstm_models[node]
             criterion = criterions[node]
 
-            for epoch in range(100):
+            # Run standard training epochs for all nodes
+            training_epochs = 100
+            
+            for epoch in range(training_epochs):
                 optimizer.zero_grad()
 
                 # Process measurement history
@@ -480,6 +501,13 @@ plt.title('Mean RMSE Over Time')
 plt.legend()
 plt.grid(True)
 
+# Add vertical line showing fault time and annotation
+fault_time = t[len(t) // 2]
+for i in range(1, 7):  # For all 6 subplots
+    plt.subplot(3, 2, i)
+    plt.axvline(x=fault_time, color='r', linestyle='--', alpha=0.5)
+    plt.text(fault_time+5, plt.ylim()[1]*0.9, 'Fault Occurs', color='r', alpha=0.7)
+
 plt.tight_layout()
 plt.savefig('satellite_tracking_results.png', dpi=300)
 plt.show()
@@ -500,3 +528,38 @@ print("\nState-wise RMSE:")
 states = ['x', 'vx', 'y', 'vy']
 for i, state in enumerate(states):
     print(f"{state:<3} - ADL-DKF: {state_rmse_adldkf[i].item():.6f}, DKCF: {state_rmse_dkcf[i].item():.6f}")
+
+# Print additional information about the fault
+print("\nFault Information:")
+print(f"Fault occurred at t = {fault_time:.1f} seconds")
+print(f"Fault type: System dynamics fault - trajectory bias and increased process noise")
+print(f"Fault details:")
+print(f"  - Position/velocity bias: [{fault_bias[0].item():.4f}, {fault_bias[1].item():.4f}, {fault_bias[2].item():.4f}, {fault_bias[3].item():.4f}]")
+print(f"  - Process noise multiplier: {fault_process_noise_multiplier}x")
+
+print("\nRMSE Before Fault:")
+pre_fault_idx = slice(1, len(t)//2)
+rmse_adldkf_pre = torch.sqrt(torch.mean(squared_error_kf[:, pre_fault_idx, :]))
+rmse_dkcf_pre = torch.sqrt(torch.mean(squared_error_dkcf[:, pre_fault_idx, :]))
+print(f"ADL-DKF: {rmse_adldkf_pre.item():.6f}")
+print(f"DKCF: {rmse_dkcf_pre.item():.6f}")
+
+print("\nRMSE After Fault:")
+post_fault_idx = slice(len(t)//2, len(t))
+rmse_adldkf_post = torch.sqrt(torch.mean(squared_error_kf[:, post_fault_idx, :]))
+rmse_dkcf_post = torch.sqrt(torch.mean(squared_error_dkcf[:, post_fault_idx, :]))
+print(f"ADL-DKF: {rmse_adldkf_post.item():.6f}")
+print(f"DKCF: {rmse_dkcf_post.item():.6f}")
+
+# Calculate adaptation time (how long it takes ADL-DKF to re-achieve pre-fault performance)
+# This is approximate - we look for when the RMSE returns to within 20% of pre-fault levels
+post_fault_rmse = rmse_adldkf_total[len(t)//2:].cpu().detach().numpy()
+pre_fault_avg = torch.mean(rmse_adldkf_total[:len(t)//2]).cpu().detach().numpy()
+threshold = pre_fault_avg * 1.2  # 20% higher than pre-fault average
+
+adaptation_indices = np.where(post_fault_rmse < threshold)[0]
+if len(adaptation_indices) > 0:
+    adaptation_time = adaptation_indices[0] * dt
+    print(f"\nADL-DKF adaptation time after fault: {adaptation_time:.2f} seconds")
+else:
+    print("\nADL-DKF did not fully adapt after the fault within the simulation time")
