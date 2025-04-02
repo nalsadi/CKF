@@ -13,16 +13,6 @@ m = 3  # Number of measurements
 num_nodes = 3  # Number of nodes
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# System matrices as PyTorch tensors
-A_np = np.array([[1, T, 0],
-                 [0, 1, T],
-                 [-557.02, -28.616, 0.9418]], dtype=np.float32)
-A = torch.tensor(A_np, dtype=torch.float32, device=device)
-Ahat = A.clone()
-B_np = np.array([[0], [0], [557.02]], dtype=np.float32)
-B = torch.tensor(B_np, dtype=torch.float32, device=device)
-C_np = np.eye(m, dtype=np.float32)
-C = torch.tensor(C_np, dtype=torch.float32, device=device)
 Q_np = np.diag([1e-5, 1e-3, 1e-1]).astype(np.float32)
 Q = torch.tensor(Q_np, dtype=torch.float32, device=device)
 
@@ -138,7 +128,7 @@ R_opts = [R_nodes[i].clone() for i in range(num_nodes)]
 delta_opts = [torch.tensor(1.0, device=device) for _ in range(num_nodes)]
 
 # Define the sliding window size
-window_size = 10
+window_size = 50
 
 # Initialize measurement histories for each node
 z_node_histories = [torch.zeros((m, len(t)), dtype=torch.float32, device=device) for _ in range(num_nodes)]
@@ -173,16 +163,16 @@ for k in range(1, len(t) - 1):
         R_node = R_nodes[node]
 
         # EKF
-        x_kf[:, k, node], P_kf[node] = ekf_filter(
-            x_kf[:, k-1, node], z_node, u[k], P_kf[node], Q_opts[node], R_opts[node]
+        x_kf[:, k+1, node], P_kf[node] = ekf_filter(
+            x_kf[:, k, node], z_node, u[k], P_kf[node], Q_opts[node], R_opts[node]
         )
-        squared_error_kf[:, k, node] = (x[:, k+1] - x_kf[:, k, node])**2
+        squared_error_kf[:, k+1, node] = (x[:, k+1] - x_kf[:, k+1, node])**2
 
         # Regular EKF (comparison)
-        x_kf_reg[:, k, node], P_kf_reg[node] = ekf_filter(
-            x_kf_reg[:, k-1, node], z_node, u[k], P_kf_reg[node], Q, R_node
+        x_kf_reg[:, k+1, node], P_kf_reg[node] = ekf_filter(
+            x_kf_reg[:, k, node], z_node, u[k], P_kf_reg[node], Q, R_node
         )
-        squared_error_kf_reg[:, k, node] = (x[:, k+1] - x_kf_reg[:, k, node])**2
+        squared_error_kf_reg[:, k+1, node] = (x[:, k+1] - x_kf_reg[:, k+1, node])**2
 
         # Every 10 steps, update parameters
         if k % 10 == 0:
@@ -219,7 +209,7 @@ for k in range(1, len(t) - 1):
                 delta_opt = delta_out.squeeze()
 
                 # Create a dummy prediction model to enable backpropagation
-                x_prev = x_kf[:, k-1, node].clone().detach().requires_grad_(True)
+                x_prev = x_kf[:, k, node].clone().detach().requires_grad_(True)
                 z_target = z_node.clone().detach()  # Target measurement
                 
                 # Forward pass through the filter
@@ -236,10 +226,10 @@ for k in range(1, len(t) - 1):
                 # Update parameters
                 with torch.no_grad():
                     x_kf_eval, P_kf_eval = ekf_filter(
-                        x_kf[:, k-1, node], z_node, u[k], P_kf[node],
+                        x_kf[:, k, node], z_node, u[k], P_kf[node],
                         Q_opt.detach(), R_opt.detach()
                     )
-                    x_kf[:, k, node] = x_kf_eval
+                    x_kf[:, k+1, node] = x_kf_eval
                     P_kf[node] = P_kf_eval
                     Q_opts[node] = Q_opt.detach()
                     R_opts[node] = R_opt.detach()
