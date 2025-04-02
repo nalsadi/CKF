@@ -221,10 +221,16 @@ dkcf_states = torch.zeros((N, len(t), n), dtype=torch.float32, device=device)
 P_dkcf = [torch.eye(n, dtype=torch.float32, device=device) for _ in range(N)]
 squared_error_dkcf = torch.zeros((n, len(t), N), dtype=torch.float32, device=device)
 
+# Initialize UKF variables
+ukf_states = torch.zeros((N, len(t), n), dtype=torch.float32, device=device)
+P_ukf = [torch.eye(n, dtype=torch.float32, device=device) for _ in range(N)]
+squared_error_ukf = torch.zeros((n, len(t), N), dtype=torch.float32, device=device)
+
 # Initialize all KF with same initial state
 for node in range(num_nodes):
     x_kf[:, 0, node] = torch.tensor(x0_true, dtype=torch.float32, device=device) + torch.randn(n, device=device) * 0.1
     dkcf_states[node, 0, :] = torch.tensor(x0_true, dtype=torch.float32, device=device) + torch.randn(n, device=device) * 0.1
+    ukf_states[node, 0, :] = torch.tensor(x0_true, dtype=torch.float32, device=device) + torch.randn(n, device=device) * 0.1
 
 # Kalman Filter functions
 def kf_predict(x, u, P, Q, dt):
@@ -307,6 +313,67 @@ def ssf_update(x_pred, z, P_pred, R, sensor_pos, delta):
     
     return x_updated, P_updated, z_pred
 
+def ukf_predict(x, P, Q, dt):
+    # Generate sigma points
+    n = x.shape[0]
+    sigma_points = torch.zeros((2 * n + 1, n), dtype=torch.float32, device=device)
+    weights_mean = torch.zeros((2 * n + 1), dtype=torch.float32, device=device)
+    weights_cov = torch.zeros((2 * n + 1), dtype=torch.float32, device=device)
+    
+    lambda_ = 3 - n  # Scaling parameter
+    # Increase regularization further to 1e-2 to ensure positive-definiteness
+    sqrt_P = torch.linalg.cholesky(P + torch.eye(n, device=device) * 1e-2)
+    
+    sigma_points[0] = x
+    weights_mean[0] = lambda_ / (n + lambda_)
+    weights_cov[0] = lambda_ / (n + lambda_)
+    
+    scale = torch.sqrt(torch.tensor(float(n + lambda_), dtype=torch.float32, device=device))
+    
+    for i in range(n):
+        sigma_points[i + 1] = x + scale * sqrt_P[:, i]
+        sigma_points[i + 1 + n] = x - scale * sqrt_P[:, i]
+        weights_mean[i + 1] = 1 / (2 * (n + lambda_))
+        weights_mean[i + 1 + n] = 1 / (2 * (n + lambda_))
+        weights_cov[i + 1] = 1 / (2 * (n + lambda_))
+        weights_cov[i + 1 + n] = 1 / (2 * (n + lambda_))
+    
+    sigma_points_pred = torch.stack([satellite_motion_model(sp.unsqueeze(0), dt).squeeze(0) for sp in sigma_points])
+    x_pred = torch.sum(weights_mean.unsqueeze(1) * sigma_points_pred, dim=0)
+    P_pred = Q.clone()
+    for i in range(2 * n + 1):
+        diff = sigma_points_pred[i] - x_pred
+        P_pred += weights_cov[i] * torch.outer(diff, diff)
+    
+    return x_pred, P_pred, sigma_points_pred, weights_mean, weights_cov
+
+def ukf_update(x_pred, P_pred, z, R, sensor_pos, sigma_points, weights_mean, weights_cov):
+    # Predict measurements
+    sigma_points_meas = torch.stack([measurement_model(sp.unsqueeze(0), sensor_pos.unsqueeze(0)).squeeze(0) for sp in sigma_points])
+    z_pred = torch.sum(weights_mean.unsqueeze(1) * sigma_points_meas, dim=0)
+    
+    # Compute innovation covariance
+    S = R.clone()
+    for i in range(sigma_points_meas.shape[0]):
+        diff = sigma_points_meas[i] - z_pred
+        S += weights_cov[i] * torch.outer(diff, diff)
+    
+    # Compute cross-covariance
+    C = torch.zeros((n, m), dtype=torch.float32, device=device)
+    for i in range(sigma_points_meas.shape[0]):
+        diff_x = sigma_points[i] - x_pred
+        diff_z = sigma_points_meas[i] - z_pred
+        C += weights_cov[i] * torch.outer(diff_x, diff_z)
+    
+    # Compute Kalman gain
+    K = C @ torch.linalg.pinv(S)
+    
+    # Update state and covariance
+    y = z - z_pred
+    x_updated = x_pred + K @ y
+    P_updated = P_pred - K @ S @ K.T
+    
+    return x_updated, P_updated, z_pred
 
 # Generate true satellite trajectory
 for k in range(1, len(t)):
@@ -437,19 +504,41 @@ for k in range(1, len(t)):
         dkcf_states[i, k, :] = x_i + c * (mean_state - x_i)
         squared_error_dkcf[:, k, i] = (x[:, k] - dkcf_states[i, k, :])**2
 
+    # ----- DUKF -----
+    for i in range(N):
+        sensor_pos = sensor_positions_torch[k][i]
+        z_tensor = z[:, k, i]
+        
+        # Update using the Unscented Kalman Filter
+        x_pred_ukf, P_pred_ukf, sigma_points, weights_mean, weights_cov = ukf_predict(
+            ukf_states[i, k-1, :], P_ukf[i], Q, dt
+        )
+        x_updated_ukf, P_ukf[i], _ = ukf_update(
+            x_pred_ukf, P_pred_ukf, z_tensor, R_list[i], sensor_pos, sigma_points, weights_mean, weights_cov
+        )
+        ukf_states[i, k, :] = x_updated_ukf.flatten()
+
+    # Take the mean across all nodes for UKF-DKCF
+    mean_state_ukf = torch.mean(ukf_states[:, k, :], dim=0)  # Mean across all nodes
+    for i in range(N):
+        squared_error_ukf[:, k, i] = (x[:, k] - mean_state_ukf)**2
+
 
 # Compute RMSE per state over time (using consensus states)
 rmse_adldkf_state = torch.sqrt(torch.mean(squared_error_kf, dim=(0, 2)))  # Mean across states and nodes
 rmse_dkcf_state = torch.sqrt(torch.mean(squared_error_dkcf, dim=(0, 2)))  # Mean across states and nodes
+rmse_ukf_state = torch.sqrt(torch.mean(squared_error_ukf, dim=(0, 2)))  # Mean across states and nodes
 
 # Compute total RMSE over time (using consensus states)
 rmse_adldkf_total = torch.sqrt(torch.sum(torch.mean(squared_error_kf, dim=2), dim=0))
 rmse_dkcf_total = torch.sqrt(torch.sum(torch.mean(squared_error_dkcf, dim=2), dim=0))
+rmse_ukf_total = torch.sqrt(torch.sum(torch.mean(squared_error_ukf, dim=2), dim=0))
 
 # Convert to numpy for plotting (use mean states across nodes)
 x_np = x.cpu().detach().numpy()
 x_kf_mean = torch.mean(x_kf, dim=2).cpu().detach().numpy()  # Mean across nodes
 dkcf_mean = torch.mean(dkcf_states, dim=0).cpu().detach().numpy()  # Mean across nodes
+ukf_mean = torch.mean(ukf_states, dim=0).cpu().detach().numpy()  # Mean across nodes
 
 # Create figure with 3 rows and 2 columns
 plt.figure(figsize=(15, 12))
@@ -459,6 +548,7 @@ plt.subplot(3, 2, 1)
 plt.plot(x_np[0, 1:], x_np[2, 1:], 'k-', label='True', linewidth=2)
 plt.plot(x_kf_mean[0, 1:], x_kf_mean[2, 1:], 'r--', label='ADL-DKF', linewidth=1.5)
 plt.plot(dkcf_mean[1:, 0], dkcf_mean[1:, 2], 'g-.', label='DKCF', linewidth=1.5)
+plt.plot(ukf_mean[1:, 0], ukf_mean[1:, 2], 'c-.', label='UKF-DKCF', linewidth=1.5)
 plt.xlabel('X Position (km)')
 plt.ylabel('Y Position (km)')
 plt.title('Satellite Trajectory')
@@ -469,6 +559,7 @@ plt.grid(True)
 plt.subplot(3, 2, 2)
 plt.plot(t[1:], x_np[0, 1:] - x_kf_mean[0, 1:], 'r--', label='ADL-DKF')
 plt.plot(t[1:], x_np[0, 1:] - dkcf_mean[1:, 0], 'g-.', label='DKCF')
+plt.plot(t[1:], x_np[0, 1:] - ukf_mean[1:, 0], 'c-.', label='UKF-DKCF')
 plt.xlabel('Time (sec)')
 plt.ylabel('X Position Error (km)')
 plt.title('X Position Error')
@@ -479,6 +570,7 @@ plt.grid(True)
 plt.subplot(3, 2, 3)
 plt.plot(t[1:], x_np[2, 1:] - x_kf_mean[2, 1:], 'r--', label='ADL-DKF')
 plt.plot(t[1:], x_np[2, 1:] - dkcf_mean[1:, 2], 'g-.', label='DKCF')
+plt.plot(t[1:], x_np[2, 1:] - ukf_mean[1:, 2], 'c-.', label='UKF-DKCF')
 plt.xlabel('Time (sec)')
 plt.ylabel('Y Position Error (km)')
 plt.title('Y Position Error')
@@ -491,8 +583,10 @@ true_vel = np.sqrt(x_np[1, :]**2 + x_np[3, :]**2)
 plt.plot(t, true_vel, 'k-', label='True Velocity', linewidth=2)
 adldkf_vel = np.sqrt(x_kf_mean[1, :]**2 + x_kf_mean[3, :]**2)
 dkcf_vel = np.sqrt(dkcf_mean[:, 1]**2 + dkcf_mean[:, 3]**2)
+ukf_vel = np.sqrt(ukf_mean[:, 1]**2 + ukf_mean[:, 3]**2)
 plt.plot(t, adldkf_vel, 'r--', label='ADL-DKF')
 plt.plot(t, dkcf_vel, 'g-.', label='DKCF')
+plt.plot(t, ukf_vel, 'c-.', label='UKF-DKCF')
 plt.xlabel('Time (sec)')
 plt.ylabel('Velocity (km/s)')
 plt.title('Velocity Estimation')
@@ -503,6 +597,7 @@ plt.grid(True)
 plt.subplot(3, 2, 5)
 plt.plot(t[1:], rmse_adldkf_total[1:].cpu().detach().numpy(), 'r-', label='ADL-DKF')
 plt.plot(t[1:], rmse_dkcf_total[1:].cpu().detach().numpy(), 'g-', label='DKCF')
+plt.plot(t[1:], rmse_ukf_total[1:].cpu().detach().numpy(), 'c-', label='UKF-DKCF')
 plt.xlabel('Time (sec)')
 plt.ylabel('Total RMSE')
 plt.title('Total RMSE Over Time')
@@ -513,6 +608,7 @@ plt.grid(True)
 plt.subplot(3, 2, 6)
 plt.plot(t[1:], rmse_adldkf_state[1:].cpu().detach().numpy(), 'r-', label='ADL-DKF')
 plt.plot(t[1:], rmse_dkcf_state[1:].cpu().detach().numpy(), 'g-', label='DKCF')
+plt.plot(t[1:], rmse_ukf_state[1:].cpu().detach().numpy(), 'c-', label='UKF-DKCF')
 plt.xlabel('Time (sec)')
 plt.ylabel('Mean RMSE')
 plt.title('Mean RMSE Over Time')
@@ -551,6 +647,9 @@ ax.plot(x_kf_mean[0, :], x_kf_mean[2, :], target_height, 'g-.', label='ADL-DKF E
 # Plot DKCF estimated trajectory
 ax.plot(dkcf_mean[:, 0], dkcf_mean[:, 2], target_height, 'm-.', label='DKCF Estimated Trajectory', linewidth=1.5)
 
+# Plot UKF-DKCF estimated trajectory
+ax.plot(ukf_mean[:, 0], ukf_mean[:, 2], target_height, 'c-.', label='UKF-DKCF Estimated Trajectory', linewidth=1.5)
+
 # Set labels and title
 ax.set_xlabel('X Position (km)')
 ax.set_ylabel('Y Position (km)')
@@ -566,19 +665,22 @@ plt.show()
 # Compute overall RMSE properly considering all dimensions
 rmse_adldkf = torch.sqrt(torch.mean(squared_error_kf[:, 1:, :]))  # Mean across states, time, nodes
 rmse_dkcf = torch.sqrt(torch.mean(squared_error_dkcf[:, 1:, :]))  # Mean across states, time, nodes
+rmse_ukf = torch.sqrt(torch.mean(squared_error_ukf[:, 1:, :]))  # Mean across states, time, nodes
 
 print("\nOverall Mean RMSE:")
 print(f"ADL-DKF: {rmse_adldkf.item():.6f}")
 print(f"DKCF: {rmse_dkcf.item():.6f}")
+print(f"UKF-DKCF: {rmse_ukf.item():.6f}")
 
 # Also print state-wise RMSE
 state_rmse_adldkf = torch.sqrt(torch.mean(squared_error_kf[:, 1:, :], dim=(1, 2)))  # Per state RMSE
 state_rmse_dkcf = torch.sqrt(torch.mean(squared_error_dkcf[:, 1:, :], dim=(1, 2)))  # Per state RMSE
+state_rmse_ukf = torch.sqrt(torch.mean(squared_error_ukf[:, 1:, :], dim=(1, 2)))  # Per state RMSE
 
 print("\nState-wise RMSE:")
 states = ['x', 'vx', 'y', 'vy']
 for i, state in enumerate(states):
-    print(f"{state:<3} - ADL-DKF: {state_rmse_adldkf[i].item():.6f}, DKCF: {state_rmse_dkcf[i].item():.6f}")
+    print(f"{state:<3} - ADL-DKF: {state_rmse_adldkf[i].item():.6f}, DKCF: {state_rmse_dkcf[i].item():.6f}, UKF-DKCF: {state_rmse_ukf[i].item():.6f}")
 
 # Print additional information about the fault
 print("\nFault Information:")
@@ -592,15 +694,19 @@ print("\nRMSE Before Fault:")
 pre_fault_idx = slice(1, len(t)//2)
 rmse_adldkf_pre = torch.sqrt(torch.mean(squared_error_kf[:, pre_fault_idx, :]))
 rmse_dkcf_pre = torch.sqrt(torch.mean(squared_error_dkcf[:, pre_fault_idx, :]))
+rmse_ukf_pre = torch.sqrt(torch.mean(squared_error_ukf[:, pre_fault_idx, :]))
 print(f"ADL-DKF: {rmse_adldkf_pre.item():.6f}")
 print(f"DKCF: {rmse_dkcf_pre.item():.6f}")
+print(f"UKF-DKCF: {rmse_ukf_pre.item():.6f}")
 
 print("\nRMSE After Fault:")
 post_fault_idx = slice(len(t)//2, len(t))
 rmse_adldkf_post = torch.sqrt(torch.mean(squared_error_kf[:, post_fault_idx, :]))
 rmse_dkcf_post = torch.sqrt(torch.mean(squared_error_dkcf[:, post_fault_idx, :]))
+rmse_ukf_post = torch.sqrt(torch.mean(squared_error_ukf[:, post_fault_idx, :]))
 print(f"ADL-DKF: {rmse_adldkf_post.item():.6f}")
 print(f"DKCF: {rmse_dkcf_post.item():.6f}")
+print(f"UKF-DKCF: {rmse_ukf_post.item():.6f}")
 
 # Calculate adaptation time (how long it takes ADL-DKF to re-achieve pre-fault performance)
 # This is approximate - we look for when the RMSE returns to within 20% of pre-fault levels
