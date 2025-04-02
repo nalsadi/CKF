@@ -46,7 +46,7 @@ optimizers = []
 criterions = []
 
 for _ in range(num_nodes):
-    lstm_model = LSTMEstimator(input_dim=m, hidden_dim=32, output_dim=2 * n + 1).to(device)
+    lstm_model = LSTMEstimator(input_dim=m, hidden_dim=32, output_dim=2 * n).to(device)
     optimizer = optim.Adam(lstm_model.parameters(), lr=1e-3)
     criterion = nn.MSELoss()
     lstm_models.append(lstm_model)
@@ -125,7 +125,6 @@ squared_error_kf_reg = torch.zeros((n, len(t), num_nodes), dtype=torch.float32, 
 # LSTM parameters for each node
 Q_opts = [Q.clone() for _ in range(num_nodes)]
 R_opts = [R_nodes[i].clone() for i in range(num_nodes)]
-delta_opts = [torch.tensor(1.0, device=device) for _ in range(num_nodes)]
 
 # Define the sliding window size
 window_size = 50
@@ -178,7 +177,6 @@ for k in range(1, len(t) - 1):
         if k % 10 == 0:
             Q_opts[node] = Q.clone()
             R_opts[node] = R_nodes[node].clone()
-            delta_opts[node] = torch.tensor(1.0, device=device)
 
         # Every 100 steps, LSTM-based parameter update
         if k % 50 == 0:
@@ -202,11 +200,9 @@ for k in range(1, len(t) - 1):
                 # Extract and apply LSTM parameters
                 q_diag = torch.nn.functional.softplus(lstm_output[:, :n])
                 r_diag = torch.nn.functional.softplus(lstm_output[:, n:2*n])
-                delta_out = torch.nn.functional.softplus(lstm_output[:, 2*n:])
 
                 Q_opt = torch.diag_embed(q_diag).squeeze(0)
                 R_opt = torch.diag_embed(r_diag).squeeze(0)
-                delta_opt = delta_out.squeeze()
 
                 # Create a dummy prediction model to enable backpropagation
                 x_prev = x_kf[:, k, node].clone().detach().requires_grad_(True)
@@ -233,7 +229,6 @@ for k in range(1, len(t) - 1):
                     P_kf[node] = P_kf_eval
                     Q_opts[node] = Q_opt.detach()
                     R_opts[node] = R_opt.detach()
-                    delta_opts[node] = delta_opt.detach()
 
     # Optional progress print
     if k % 100 == 0:
