@@ -7,7 +7,7 @@ from mpl_toolkits.mplot3d import Axes3D
 
 # Simulation parameters
 tf = 100  # Final time in simulation (seconds)
-dt = 0.5  # Sample rate (seconds)
+dt = 0.7  # Sample rate (seconds)
 t = np.arange(0, tf + dt, dt)  # Time vector
 n = 4  # Number of states [x, vx, y, vy]
 m = 3  # Number of measurements [range, azimuth, elevation]
@@ -164,8 +164,8 @@ lstm_models = []
 optimizers = []
 criterions = []
 for _ in range(num_nodes):
-    # Change output_dim to n + m to match Q (n×n) and R (m×m) diagonal elements
-    model = LSTMEstimator(input_dim=m, hidden_dim=32, output_dim=n+m).to(device)
+    # Change output_dim to n + m + 1 to include Q diag, R diag, and delta
+    model = LSTMEstimator(input_dim=m, hidden_dim=32, output_dim=n+m+1).to(device)
     lstm_models.append(model)
     optimizers.append(optim.Adam(model.parameters(), lr=1e-1 / 2))
     criterions.append(nn.MSELoss())
@@ -179,6 +179,8 @@ z_node_histories = [torch.zeros((m, window_size), dtype=torch.float32, device=de
 # Initialize optimal Q and R matrices for each node
 Q_opts = [Q.clone() for _ in range(num_nodes)]
 R_opts = [R.clone() for _ in range(num_nodes)]
+# Initialize delta values for each node
+delta_opts = [0.01 for _ in range(num_nodes)]  # Default delta value of 0.01
 
 # Add DKCF parameters
 N = num_nodes  # Number of nodes for DKCF
@@ -252,6 +254,42 @@ def kf_update(x_pred, z, P_pred, R, sensor_pos):
     
     return x_updated, P_updated, z_pred
 
+def sigmoid_saturation(innov, delta, alpha=1.0):
+    return 1 / (1 + torch.exp(-alpha * (torch.abs(innov) - delta)))
+
+def ssf_update(x_pred, z, P_pred, R, sensor_pos, delta):
+    # Get measurement prediction
+    z_pred = measurement_model(x_pred.unsqueeze(0), sensor_pos.unsqueeze(0)).squeeze(0)
+    
+    # Calculate Jacobian
+    H = torch.zeros((m, n), device=device)
+    epsilon = 1e-4
+    
+    for j in range(n):
+        x_perturbed = x_pred.clone()
+        x_perturbed[j] += epsilon
+        z_perturbed = measurement_model(x_perturbed.unsqueeze(0), sensor_pos.unsqueeze(0)).squeeze(0)
+        H[:, j] = (z_perturbed - z_pred) / epsilon
+    
+    # Calculate innovation
+    y = z - z_pred
+
+    # Wrap angle differences to [-pi, pi]
+    y[1:3] = torch.atan2(torch.sin(y[1:3]), torch.cos(y[1:3]))
+    
+    S = H @ P_pred @ H.T + R
+
+    innov = y
+    sat = sigmoid_saturation(innov, delta, alpha=1.0)
+    
+    K = P_pred @ H.T @ torch.linalg.pinv(S)
+
+    x_updated = x_pred + K @ (sat * innov)
+    P_updated = (torch.eye(n, device=device) - K @ H) @ P_pred
+    
+    return x_updated, P_updated, z_pred
+
+
 # Generate true satellite trajectory
 for k in range(1, len(t)):
     # True system dynamics
@@ -284,12 +322,12 @@ for k in range(1, len(t)):
         z_node_histories[node][:, -1] = z_node
 
         # LSTM parameter updates (every 10 steps)
-        if k % 20 == 0 and k > window_size:
+        if k % 10 == 0 and k > window_size:
             optimizer = optimizers[node]
             lstm_model = lstm_models[node]
             criterion = criterions[node]
 
-            for epoch in range(10):
+            for epoch in range(100):
                 optimizer.zero_grad()
 
                 # Process measurement history
@@ -301,20 +339,25 @@ for k in range(1, len(t)):
                 lstm_output = lstm_model(z_input_tensor_normalized)
                 # Extract first n elements for Q diagonal
                 q_diag = torch.nn.functional.softplus(lstm_output[:, :n])
-                # Extract last m elements for R diagonal
+                # Extract next m elements for R diagonal
                 r_diag = torch.nn.functional.softplus(lstm_output[:, n:n+m])
+                # Extract delta parameter (single value)
+                delta_out = torch.nn.functional.softplus(lstm_output[:, n+m:])
 
                 Q_opt = torch.diag_embed(q_diag).squeeze(0)
                 R_opt = torch.diag_embed(r_diag).squeeze(0)
+                # Extract scalar delta value
+                delta = delta_out.squeeze().item()
 
                 # Forward pass through filter
                 x_prev = x_kf[:, k-1, node].clone().detach().requires_grad_(True)
                 x_pred, P_pred, _ = kf_predict(x_prev, None, P_kf[node], Q_opt, dt)
-                x_updated, _, z_pred = kf_update(x_pred, z_node, P_pred, R_opt, sensor_pos)
+                # Pass learned delta to ssf_update
+                x_updated, _, z_pred = ssf_update(x_pred, z_node, P_pred, R_opt, sensor_pos, delta=delta)
 
                 # Compute and backpropagate loss
                 loss = criterion(z_pred, z_node)
-                print(f"Node {node+1}, Epoch {epoch+1}, Loss: {loss.item()}")
+                print(f"Node {node+1}, Epoch {epoch+1}, Loss: {loss.item()}, Delta: {delta:.4f}")
                 loss.backward()
                 optimizer.step()
 
@@ -322,10 +365,11 @@ for k in range(1, len(t)):
                 with torch.no_grad():
                     Q_opts[node] = Q_opt.detach()
                     R_opts[node] = R_opt.detach()
+                    delta_opts[node] = delta  # Save the delta value
 
         # Regular filter update using current optimal parameters
         x_pred_adldkf, P_pred_adldkf, _ = kf_predict(x_kf[:, k-1, node], None, P_kf[node], Q_opts[node], dt)
-        x_kf[:, k, node], P_kf[node], _ = kf_update(x_pred_adldkf, z_node, P_pred_adldkf, R_opts[node], sensor_pos)
+        x_kf[:, k, node], P_kf[node], _ = ssf_update(x_pred_adldkf, z_node, P_pred_adldkf, R_opts[node], sensor_pos, delta=delta_opts[node])
 
     # Consensus step for ADL-DKF using mean of all nodes
     mean_state = torch.mean(x_kf[:, k, :], dim=1)  # Mean across all nodes
