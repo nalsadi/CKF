@@ -159,10 +159,26 @@ class LSTMEstimator(nn.Module):
         lstm_out, _ = self.lstm(x)
         return self.fc(lstm_out[:, -1, :])
 
-# Initialize LSTM model, optimizer, and loss function
-lstm_model = LSTMEstimator(input_dim=m, hidden_dim=32, output_dim=n+m).to(device)
-optimizer = optim.Adam(lstm_model.parameters(), lr=1e-3)
-criterion = nn.MSELoss()
+# Initialize LSTM models and optimizers for each node
+lstm_models = []
+optimizers = []
+criterions = []
+for _ in range(num_nodes):
+    # Change output_dim to n + m to match Q (n×n) and R (m×m) diagonal elements
+    model = LSTMEstimator(input_dim=m, hidden_dim=32, output_dim=n+m).to(device)
+    lstm_models.append(model)
+    optimizers.append(optim.Adam(model.parameters(), lr=1e-3))
+    criterions.append(nn.MSELoss())
+
+# Define the sliding window size
+window_size = 100
+
+# Initialize measurement history for each node
+z_node_histories = [torch.zeros((m, window_size), dtype=torch.float32, device=device) for _ in range(num_nodes)]
+
+# Initialize optimal Q and R matrices for each node
+Q_opts = [Q.clone() for _ in range(num_nodes)]
+R_opts = [R.clone() for _ in range(num_nodes)]
 
 # Add DKCF parameters
 N = num_nodes  # Number of nodes for DKCF
@@ -253,42 +269,63 @@ for k in range(1, len(t)):
             dtype=torch.float32, device=device)
         z[:, k, node] = true_measurement + v
 
-# Define the sliding window size
-window_size = 20
 
 # Simulation loop
 for k in range(1, len(t)):
-    # ----- ADL-DKF (LSTM-based approach) -----
-    if k > window_size:
-        # Use the last `window_size` entries for the LSTM input
-        z_input_tensor = z[:, max(0, k + 1 - window_size):k + 1, 0].transpose(0, 1)  # Shape: [window_size, m]
+    
+    # ----- ADL-DKF -----
+    for node in range(num_nodes):
+        sensor_pos = sensor_positions_torch[k][node]
+        z_node = z[:, k, node]
         
-        # Normalize using PyTorch functions
-        z_mean = torch.mean(z_input_tensor, dim=0)
-        z_std = torch.std(z_input_tensor, dim=0) + 1e-8
-        z_input_tensor_normalized = (z_input_tensor - z_mean) / z_std
-        
-        # Add batch dimension
-        z_input_tensor_normalized = z_input_tensor_normalized.unsqueeze(0)  # Shape: [1, window_size, m]
-        
-        # Get LSTM output
-        lstm_output = lstm_model(z_input_tensor_normalized)
-        
-        # Extract and apply LSTM parameters
-        q_diag = torch.nn.functional.softplus(lstm_output[:, :n])
-        r_diag = torch.nn.functional.softplus(lstm_output[:, n:n+m])
-        
-        Q_adldkf = torch.diag_embed(q_diag).squeeze(0)
-        R_adldkf = torch.diag_embed(r_diag).squeeze(0)
-    else:
-        Q_adldkf, R_adldkf = Q.clone(), R.clone()
+        # Update measurement history
+        z_node_histories[node] = torch.roll(z_node_histories[node], -1, dims=1)
+        z_node_histories[node][:, -1] = z_node
 
-    # ADL-DKF prediction and update
-    sensor_pos = sensor_positions_torch[k][0]
-    z_tensor = z[:, k, 0]
-    x_pred_adldkf, P_pred_adldkf, _ = kf_predict(x_kf[:, k-1, 0], None, P_kf[0], Q_adldkf, dt)
-    x_kf[:, k, 0], P_kf[0], _ = kf_update(x_pred_adldkf, z_tensor, P_pred_adldkf, R_adldkf, sensor_pos)
-    squared_error_kf[:, k, 0] = (x[:, k] - x_kf[:, k, 0])**2
+        # Every 50 steps, update LSTM parameters
+        if k % 50 == 0 and k > window_size:
+            optimizer = optimizers[node]
+            lstm_model = lstm_models[node]
+            criterion = criterions[node]
+
+            for epoch in range(10):
+                optimizer.zero_grad()
+
+                # Process measurement history
+                z_input_tensor = z_node_histories[node].T  # Shape: [window_size, m]
+                z_input_tensor_normalized = (z_input_tensor - torch.mean(z_input_tensor, dim=0)) / (torch.std(z_input_tensor, dim=0) + 1e-8)
+                z_input_tensor_normalized = z_input_tensor_normalized.unsqueeze(0)
+
+                # LSTM forward pass and parameter extraction
+                lstm_output = lstm_model(z_input_tensor_normalized)
+                # Extract first n elements for Q diagonal
+                q_diag = torch.nn.functional.softplus(lstm_output[:, :n])
+                # Extract last m elements for R diagonal
+                r_diag = torch.nn.functional.softplus(lstm_output[:, n:n+m])
+
+                Q_opt = torch.diag_embed(q_diag).squeeze(0)
+                R_opt = torch.diag_embed(r_diag).squeeze(0)
+
+                # Forward pass through filter
+                x_prev = x_kf[:, k-1, node].clone().detach().requires_grad_(True)
+                x_pred, P_pred, _ = kf_predict(x_prev, None, P_kf[node], Q_opt, dt)
+                x_updated, _, z_pred = kf_update(x_pred, z_node, P_pred, R_opt, sensor_pos)
+
+                # Compute and backpropagate loss
+                loss = criterion(z_pred, z_node)
+                print(f"Node {node+1}, Epoch {epoch+1}, Loss: {loss.item()}")
+                loss.backward()
+                optimizer.step()
+
+                # Update filter parameters
+                with torch.no_grad():
+                    Q_opts[node] = Q_opt.detach()
+                    R_opts[node] = R_opt.detach()
+
+        # Regular filter update using current optimal parameters
+        x_pred_adldkf, P_pred_adldkf, _ = kf_predict(x_kf[:, k-1, node], None, P_kf[node], Q_opts[node], dt)
+        x_kf[:, k, node], P_kf[node], _ = kf_update(x_pred_adldkf, z_node, P_pred_adldkf, R_opts[node], sensor_pos)
+        squared_error_kf[:, k, node] = (x[:, k] - x_kf[:, k, node])**2
 
     # ----- DKCF -----
     for i in range(N):
@@ -306,6 +343,7 @@ for k in range(1, len(t)):
         x_i = dkcf_states[i, k, :]
         dkcf_states[i, k, :] = x_i + c * (mean_state - x_i)
         squared_error_dkcf[:, k, i] = (x[:, k] - dkcf_states[i, k, :])**2
+
 
 # Compute RMSE per state over time
 rmse_adldkf_state = torch.sqrt(torch.mean(squared_error_kf[:, :, 0], dim=0))  # Shape: (len(t),)
