@@ -57,6 +57,9 @@ for k in range(1, len(t)):
             current_positions.append(sensor.copy())
     sensor_positions.append(current_positions)
 
+# Store the mobile sensor trajectory for 3D visualization
+mobile_sensor_trajectory = np.array([sensor_positions[k][num_nodes-1] for k in range(len(t))])
+
 # Convert to PyTorch tensors
 sensor_positions_torch = [torch.tensor(pos_list, dtype=torch.float32, device=device) 
                           for pos_list in sensor_positions]
@@ -510,6 +513,39 @@ for i in range(2, 7):  # For all 6 subplots
 
 plt.tight_layout()
 plt.savefig('satellite_tracking_results.png', dpi=300)
+plt.show()
+
+# 3D Visualization of object movement, static and moving sensors, and estimates
+fig = plt.figure(figsize=(10, 8))
+ax = fig.add_subplot(111, projection='3d')
+
+# Plot true object trajectory
+ax.plot(x_np[0, :], x_np[2, :], target_height, 'k-', label='True Object Trajectory', linewidth=2)
+
+# Plot mobile sensor trajectory
+ax.plot(mobile_sensor_trajectory[:, 0], mobile_sensor_trajectory[:, 1], mobile_sensor_trajectory[:, 2], 
+        'b--', label='Mobile Sensor Trajectory', linewidth=1.5)
+
+# Plot static sensor positions
+for sensor in static_sensors:
+    ax.scatter(sensor[0], sensor[1], sensor[2], c='r', marker='o', label='Static Sensor')
+
+# Plot ADL-DKF estimated trajectory
+ax.plot(x_kf_mean[0, :], x_kf_mean[2, :], target_height, 'g-.', label='ADL-DKF Estimated Trajectory', linewidth=1.5)
+
+# Plot DKCF estimated trajectory
+ax.plot(dkcf_mean[:, 0], dkcf_mean[:, 2], target_height, 'm-.', label='DKCF Estimated Trajectory', linewidth=1.5)
+
+# Set labels and title
+ax.set_xlabel('X Position (km)')
+ax.set_ylabel('Y Position (km)')
+ax.set_zlabel('Height (km)')
+ax.set_title('3D Visualization of Object Movement and Sensor Positions')
+ax.legend()
+
+# Adjust layout and save the figure
+plt.tight_layout()
+plt.savefig('object_movement_3d.png', dpi=300)
 plt.show()
 
 # Compute overall RMSE properly considering all dimensions
