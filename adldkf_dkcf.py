@@ -497,12 +497,13 @@ for k in range(1, len(t)):
         x_updated, P_dkcf[i], _ = kf_update(x_pred_dkcf, z_tensor, P_pred_dkcf, R_list[i], sensor_pos)
         dkcf_states[i, k, :] = x_updated.flatten()
 
-    # Consensus step for DKCF using mean of all nodes
+    # Force all nodes to use the mean state and covariance
     mean_state = torch.mean(dkcf_states[:, k, :], dim=0)  # Mean across all nodes
+    mean_P = torch.mean(torch.stack(P_dkcf), dim=0)
     for i in range(N):
-        x_i = dkcf_states[i, k, :]
-        dkcf_states[i, k, :] = x_i + c * (mean_state - x_i)
-        squared_error_dkcf[:, k, i] = (x[:, k] - dkcf_states[i, k, :])**2
+        dkcf_states[i, k, :] = mean_state
+        P_dkcf[i] = mean_P
+        squared_error_dkcf[:, k, i] = (x[:, k] - mean_state)**2
 
     # ----- DUKF -----
     for i in range(N):
@@ -518,9 +519,12 @@ for k in range(1, len(t)):
         )
         ukf_states[i, k, :] = x_updated_ukf.flatten()
 
-    # Take the mean across all nodes for UKF-DKCF
+    # Force all nodes to use the mean state and covariance
     mean_state_ukf = torch.mean(ukf_states[:, k, :], dim=0)  # Mean across all nodes
+    mean_P_ukf = torch.mean(torch.stack(P_ukf), dim=0)
     for i in range(N):
+        ukf_states[i, k, :] = mean_state_ukf
+        P_ukf[i] = mean_P_ukf
         squared_error_ukf[:, k, i] = (x[:, k] - mean_state_ukf)**2
 
 
