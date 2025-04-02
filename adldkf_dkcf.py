@@ -167,11 +167,11 @@ for _ in range(num_nodes):
     # Change output_dim to n + m to match Q (n×n) and R (m×m) diagonal elements
     model = LSTMEstimator(input_dim=m, hidden_dim=32, output_dim=n+m).to(device)
     lstm_models.append(model)
-    optimizers.append(optim.Adam(model.parameters(), lr=1e-3))
+    optimizers.append(optim.Adam(model.parameters(), lr=1e-1 / 2))
     criterions.append(nn.MSELoss())
 
 # Define the sliding window size
-window_size = 100
+window_size = 10
 
 # Initialize measurement history for each node
 z_node_histories = [torch.zeros((m, window_size), dtype=torch.float32, device=device) for _ in range(num_nodes)]
@@ -274,6 +274,7 @@ for k in range(1, len(t)):
 for k in range(1, len(t)):
     
     # ----- ADL-DKF -----
+    # First update individual node estimates
     for node in range(num_nodes):
         sensor_pos = sensor_positions_torch[k][node]
         z_node = z[:, k, node]
@@ -282,8 +283,8 @@ for k in range(1, len(t)):
         z_node_histories[node] = torch.roll(z_node_histories[node], -1, dims=1)
         z_node_histories[node][:, -1] = z_node
 
-        # Every 50 steps, update LSTM parameters
-        if k % 50 == 0 and k > window_size:
+        # LSTM parameter updates (every 10 steps)
+        if k % 20 == 0 and k > window_size:
             optimizer = optimizers[node]
             lstm_model = lstm_models[node]
             criterion = criterions[node]
@@ -325,7 +326,16 @@ for k in range(1, len(t)):
         # Regular filter update using current optimal parameters
         x_pred_adldkf, P_pred_adldkf, _ = kf_predict(x_kf[:, k-1, node], None, P_kf[node], Q_opts[node], dt)
         x_kf[:, k, node], P_kf[node], _ = kf_update(x_pred_adldkf, z_node, P_pred_adldkf, R_opts[node], sensor_pos)
-        squared_error_kf[:, k, node] = (x[:, k] - x_kf[:, k, node])**2
+
+    # Consensus step for ADL-DKF using mean of all nodes
+    mean_state = torch.mean(x_kf[:, k, :], dim=1)  # Mean across all nodes
+    mean_P = torch.mean(torch.stack([P_kf[i] for i in range(num_nodes)]), dim=0)
+    
+    # Update all nodes with consensus state
+    for node in range(num_nodes):
+        x_kf[:, k, node] = mean_state
+        P_kf[node] = mean_P
+        squared_error_kf[:, k, node] = (x[:, k] - mean_state)**2
 
     # ----- DKCF -----
     for i in range(N):
@@ -345,27 +355,27 @@ for k in range(1, len(t)):
         squared_error_dkcf[:, k, i] = (x[:, k] - dkcf_states[i, k, :])**2
 
 
-# Compute RMSE per state over time
-rmse_adldkf_state = torch.sqrt(torch.mean(squared_error_kf[:, :, 0], dim=0))  # Shape: (len(t),)
-rmse_dkcf_state = torch.sqrt(torch.mean(squared_error_dkcf, dim=(0, 2)))  # Shape: (len(t),)
+# Compute RMSE per state over time (using consensus states)
+rmse_adldkf_state = torch.sqrt(torch.mean(squared_error_kf, dim=(0, 2)))  # Mean across states and nodes
+rmse_dkcf_state = torch.sqrt(torch.mean(squared_error_dkcf, dim=(0, 2)))  # Mean across states and nodes
 
-# Compute total RMSE over time by summing squared errors across states
-rmse_adldkf_total = torch.sqrt(torch.sum(squared_error_kf[:, :, 0], dim=0))  # Shape: (len(t),)
-rmse_dkcf_total = torch.sqrt(torch.sum(torch.mean(squared_error_dkcf, dim=2), dim=0))  # Shape: (len(t),)
+# Compute total RMSE over time (using consensus states)
+rmse_adldkf_total = torch.sqrt(torch.sum(torch.mean(squared_error_kf, dim=2), dim=0))
+rmse_dkcf_total = torch.sqrt(torch.sum(torch.mean(squared_error_dkcf, dim=2), dim=0))
 
-# Convert to numpy for plotting
+# Convert to numpy for plotting (use mean states across nodes)
 x_np = x.cpu().detach().numpy()
-x_kf_np = x_kf.cpu().detach().numpy()
-dkcf_states_np = dkcf_states.cpu().detach().numpy()
+x_kf_mean = torch.mean(x_kf, dim=2).cpu().detach().numpy()  # Mean across nodes
+dkcf_mean = torch.mean(dkcf_states, dim=0).cpu().detach().numpy()  # Mean across nodes
 
 # Create figure with 3 rows and 2 columns
 plt.figure(figsize=(15, 12))
 
 # First row: State trajectories (x and y positions)
 plt.subplot(3, 2, 1)
-plt.plot(x_np[0, 1:], x_np[2, 1:], 'k-', label='True', linewidth=2)  # True trajectory
-plt.plot(x_kf_np[0, 1:, 0], x_kf_np[2, 1:, 0], 'r--', label='ADL-DKF', linewidth=1.5)
-plt.plot(dkcf_states_np[0, 1:, 0], dkcf_states_np[0, 1:, 2], 'g-.', label='DKCF', linewidth=1.5)
+plt.plot(x_np[0, 1:], x_np[2, 1:], 'k-', label='True', linewidth=2)
+plt.plot(x_kf_mean[0, 1:], x_kf_mean[2, 1:], 'r--', label='ADL-DKF', linewidth=1.5)
+plt.plot(dkcf_mean[1:, 0], dkcf_mean[1:, 2], 'g-.', label='DKCF', linewidth=1.5)
 plt.xlabel('X Position (km)')
 plt.ylabel('Y Position (km)')
 plt.title('Satellite Trajectory')
@@ -374,8 +384,8 @@ plt.grid(True)
 
 # Second subplot: X position error over time
 plt.subplot(3, 2, 2)
-plt.plot(t[1:], x_np[0, 1:] - x_kf_np[0, 1:, 0], 'r--', label='ADL-DKF')
-plt.plot(t[1:], x_np[0, 1:] - dkcf_states_np[0, 1:, 0], 'g-.', label='DKCF')
+plt.plot(t[1:], x_np[0, 1:] - x_kf_mean[0, 1:], 'r--', label='ADL-DKF')
+plt.plot(t[1:], x_np[0, 1:] - dkcf_mean[1:, 0], 'g-.', label='DKCF')
 plt.xlabel('Time (sec)')
 plt.ylabel('X Position Error (km)')
 plt.title('X Position Error')
@@ -384,8 +394,8 @@ plt.grid(True)
 
 # Third subplot: Y position error over time
 plt.subplot(3, 2, 3)
-plt.plot(t[1:], x_np[2, 1:] - x_kf_np[2, 1:, 0], 'r--', label='ADL-DKF')
-plt.plot(t[1:], x_np[2, 1:] - dkcf_states_np[0, 1:, 2], 'g-.', label='DKCF')
+plt.plot(t[1:], x_np[2, 1:] - x_kf_mean[2, 1:], 'r--', label='ADL-DKF')
+plt.plot(t[1:], x_np[2, 1:] - dkcf_mean[1:, 2], 'g-.', label='DKCF')
 plt.xlabel('Time (sec)')
 plt.ylabel('Y Position Error (km)')
 plt.title('Y Position Error')
@@ -396,8 +406,8 @@ plt.grid(True)
 plt.subplot(3, 2, 4)
 true_vel = np.sqrt(x_np[1, :]**2 + x_np[3, :]**2)
 plt.plot(t, true_vel, 'k-', label='True Velocity', linewidth=2)
-adldkf_vel = np.sqrt(x_kf_np[1, :, 0]**2 + x_kf_np[3, :, 0]**2)
-dkcf_vel = np.sqrt(dkcf_states_np[0, :, 1]**2 + dkcf_states_np[0, :, 3]**2)
+adldkf_vel = np.sqrt(x_kf_mean[1, :]**2 + x_kf_mean[3, :]**2)
+dkcf_vel = np.sqrt(dkcf_mean[:, 1]**2 + dkcf_mean[:, 3]**2)
 plt.plot(t, adldkf_vel, 'r--', label='ADL-DKF')
 plt.plot(t, dkcf_vel, 'g-.', label='DKCF')
 plt.xlabel('Time (sec)')
@@ -430,7 +440,19 @@ plt.tight_layout()
 plt.savefig('satellite_tracking_results.png', dpi=300)
 plt.show()
 
-# Print overall RMSE
+# Compute overall RMSE properly considering all dimensions
+rmse_adldkf = torch.sqrt(torch.mean(squared_error_kf[:, 1:, :]))  # Mean across states, time, nodes
+rmse_dkcf = torch.sqrt(torch.mean(squared_error_dkcf[:, 1:, :]))  # Mean across states, time, nodes
+
 print("\nOverall Mean RMSE:")
-print(f"ADL-DKF: {torch.mean(rmse_adldkf_total[1:]).item():.6f}")
-print(f"DKCF: {torch.mean(rmse_dkcf_total[1:]).item():.6f}")
+print(f"ADL-DKF: {rmse_adldkf.item():.6f}")
+print(f"DKCF: {rmse_dkcf.item():.6f}")
+
+# Also print state-wise RMSE
+state_rmse_adldkf = torch.sqrt(torch.mean(squared_error_kf[:, 1:, :], dim=(1, 2)))  # Per state RMSE
+state_rmse_dkcf = torch.sqrt(torch.mean(squared_error_dkcf[:, 1:, :], dim=(1, 2)))  # Per state RMSE
+
+print("\nState-wise RMSE:")
+states = ['x', 'vx', 'y', 'vy']
+for i, state in enumerate(states):
+    print(f"{state:<3} - ADL-DKF: {state_rmse_adldkf[i].item():.6f}, DKCF: {state_rmse_dkcf[i].item():.6f}")
