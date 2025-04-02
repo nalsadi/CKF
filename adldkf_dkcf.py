@@ -5,13 +5,19 @@ import torch.optim as optim
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
+# Set seeds for reproducibility
+seed = 42  # You can choose any integer value
+np.random.seed(seed)
+torch.manual_seed(seed)
+
+
+
 # Simulation parameters
 tf = 200  # Final time in simulation (seconds)
 dt = 0.7  # Sample rate (seconds)
 t = np.arange(0, tf + dt, dt)  # Time vector
 n = 4  # Number of states [x, vx, y, vy]
 m = 3  # Number of measurements [range, azimuth, elevation]
-num_nodes = 4  # Number of sensor nodes (3 static + 1 mobile)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Orbital parameters
@@ -33,16 +39,25 @@ x0_true = np.array([pos_x, vel_x, pos_y, vel_y], dtype=np.float32)
 
 # Set up sensor network
 # Format: [x, y, z]
+num_static_sensors = 8  # Number of static sensors
+sensor_radius = 20  # Radius of the circle (km)
+
+# Generate static sensors in a circular arrangement
 static_sensors = [
-    [25, 10, sensor_height],  # Sensor 1
-    [35, 10, sensor_height],  # Sensor 2
-    [45, 10, sensor_height]   # Sensor 3
+    [
+        center_x + sensor_radius * np.cos(2 * np.pi * i / num_static_sensors),
+        center_y + sensor_radius * np.sin(2 * np.pi * i / num_static_sensors),
+        sensor_height
+    ]
+    for i in range(num_static_sensors)
 ]
+
 # Mobile sensor with initial position
 mobile_sensor = [15, 10, sensor_height]
 mobile_sensor_vel = [0.05, 0.05, 0]  # Mobile sensor velocity
 
 sensor_positions = [static_sensors + [mobile_sensor]]
+num_nodes = len(static_sensors) + 1  # Update the number of nodes
 for k in range(1, len(t)):
     current_positions = []
     for i, sensor in enumerate(sensor_positions[-1]):
@@ -349,7 +364,7 @@ for k in range(1, len(t)):
             criterion = criterions[node]
 
             # Run standard training epochs for all nodes
-            training_epochs = 100
+            training_epochs = 1
             
             for epoch in range(training_epochs):
                 optimizer.zero_grad()
