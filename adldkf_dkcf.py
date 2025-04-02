@@ -503,7 +503,7 @@ plt.grid(True)
 
 # Add vertical line showing fault time and annotation
 fault_time = t[len(t) // 2]
-for i in range(1, 7):  # For all 6 subplots
+for i in range(2, 7):  # For all 6 subplots
     plt.subplot(3, 2, i)
     plt.axvline(x=fault_time, color='r', linestyle='--', alpha=0.5)
     plt.text(fault_time+5, plt.ylim()[1]*0.9, 'Fault Occurs', color='r', alpha=0.7)
