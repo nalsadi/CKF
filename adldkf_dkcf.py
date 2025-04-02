@@ -11,10 +11,9 @@ np.random.seed(seed)
 torch.manual_seed(seed)
 
 
-
 # Simulation parameters
 tf = 200  # Final time in simulation (seconds)
-dt = 0.1  # Sample rate (seconds)
+dt = 0.7  # Sample rate (seconds)
 t = np.arange(0, tf + dt, dt)  # Time vector
 n = 4  # Number of states [x, vx, y, vy]
 m = 3  # Number of measurements [range, azimuth, elevation]
@@ -185,7 +184,7 @@ for _ in range(num_nodes):
     # Change output_dim to n + m + 1 to include Q diag, R diag, and delta
     model = LSTMEstimator(input_dim=m, hidden_dim=32, output_dim=n+m+1).to(device)
     lstm_models.append(model)
-    optimizers.append(optim.Adam(model.parameters(), lr=1e-3))
+    optimizers.append(optim.RMSprop(model.parameters(), lr=1e-3))
     criterions.append(nn.MSELoss())
 
 # Define the sliding window size
