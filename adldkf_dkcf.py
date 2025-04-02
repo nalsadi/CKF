@@ -181,8 +181,8 @@ lstm_models = []
 optimizers = []
 criterions = []
 for _ in range(num_nodes):
-    # Change output_dim to n + m + 1 to include Q diag, R diag, and delta
-    model = LSTMEstimator(input_dim=m, hidden_dim=32, output_dim=n+m+1).to(device)
+    # Change output_dim to n + m + m to include Q diag, R diag, and delta per measurement
+    model = LSTMEstimator(input_dim=m, hidden_dim=32, output_dim=n+m+m).to(device)
     lstm_models.append(model)
     optimizers.append(optim.RMSprop(model.parameters(), lr=1e-3))
     criterions.append(nn.MSELoss())
@@ -197,7 +197,7 @@ z_node_histories = [torch.zeros((m, window_size), dtype=torch.float32, device=de
 Q_opts = [Q.clone() for _ in range(num_nodes)]
 R_opts = [R.clone() for _ in range(num_nodes)]
 # Initialize delta values for each node
-delta_opts = [0.01 for _ in range(num_nodes)]  # Default delta value of 0.01
+delta_opts = [torch.ones(m, dtype=torch.float32, device=device) * 0.01 for _ in range(num_nodes)]  # Default delta values per measurement
 
 # Add DKCF parameters
 N = num_nodes  # Number of nodes for DKCF
@@ -521,13 +521,12 @@ for k in range(1, len(t)):
                 q_diag = torch.nn.functional.softplus(lstm_output[:, :n])
                 # Extract next m elements for R diagonal
                 r_diag = torch.nn.functional.softplus(lstm_output[:, n:n+m])
-                # Extract delta parameter (single value)
+                # Extract delta parameters (one per measurement)
                 delta_out = torch.nn.functional.softplus(lstm_output[:, n+m:])
+                delta = delta_out.squeeze(0)  # Shape: [m]
 
                 Q_opt = torch.diag_embed(q_diag).squeeze(0)
                 R_opt = torch.diag_embed(r_diag).squeeze(0)
-                # Extract scalar delta value
-                delta = delta_out.squeeze().item()
 
                 # Forward pass through filter
                 x_prev = x_kf[:, k-1, node].clone().detach().requires_grad_(True)
@@ -537,7 +536,7 @@ for k in range(1, len(t)):
 
                 # Compute and backpropagate loss
                 loss = criterion(z_pred, z_node)
-                print(f"Node {node+1}, Epoch {epoch+1}, Loss: {loss.item()}, Delta: {delta:.4f}")
+                print(f"Node {node+1}, Epoch {epoch+1}, Loss: {loss.item()}, Delta: {delta}")
                 loss.backward()
                 optimizer.step()
 
@@ -545,7 +544,7 @@ for k in range(1, len(t)):
                 with torch.no_grad():
                     Q_opts[node] = Q_opt.detach()
                     R_opts[node] = R_opt.detach()
-                    delta_opts[node] = delta  # Save the delta value
+                    delta_opts[node] = delta  # Save the delta values (one per measurement)
 
         # Regular filter update using current optimal parameters
         x_pred_adldkf, P_pred_adldkf, _ = kf_predict(x_kf[:, k-1, node], None, P_kf[node], Q_opts[node], dt)
