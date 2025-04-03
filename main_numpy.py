@@ -102,8 +102,15 @@ def measurement_model(x, sensor_pos):
     theta = np.arctan2(dz, np.sqrt(dx**2 + dy**2))
     return np.array([r, psi, theta])
 
-# Extended Kalman Filter (EKF)
-def ekf(x, z, P, Q, R, motion_model, measurement_model, sensor_pos):
+# Import torch for sigmoid saturation
+import torch
+
+# Define sigmoid saturation function
+def sigmoid_saturation(innov, delta, alpha=1.0):
+    return 1 / (1 + torch.exp(-alpha * (innov / delta)))
+
+# Modify EKF function to include delta and sigmoid saturation
+def ekf(x, z, P, Q, R, motion_model, measurement_model, sensor_pos, delta, alpha=1.0):
     n = len(x)
     m = len(z)
     x_pred = motion_model(x, dt)
@@ -122,9 +129,10 @@ def ekf(x, z, P, Q, R, motion_model, measurement_model, sensor_pos):
         H[:, j] = (measurement_model(x_perturbed, sensor_pos) - z_pred) / epsilon
     innov = z - z_pred
     innov[1:3] = np.arctan2(np.sin(innov[1:3]), np.cos(innov[1:3]))
+    sat = sigmoid_saturation(torch.tensor(innov), torch.tensor(delta), alpha=alpha).numpy()
     S = H @ P_pred @ H.T + R
     K = P_pred @ H.T @ np.linalg.pinv(S)
-    x_updated = x_pred + K @ innov
+    x_updated = x_pred + K @ (sat * innov)
     P_updated = (np.eye(n) - K @ H) @ P_pred
     return x_updated, P_updated, z_pred
 
@@ -184,7 +192,7 @@ def create_lstm_model(input_shape, hidden_dim, output_dim):
 window_size = 50
 input_shape = (window_size, m)  # 10 time steps, m features per step
 hidden_dim = 32*4
-output_dim = n + m  # Predict Q (n values) and R (m values)
+output_dim = n + m + m  # Predict Q (n values), R (m values), and delta (m values)
 lstm_models = [create_lstm_model(input_shape, hidden_dim, output_dim) for _ in range(num_nodes)]
 
 # Initialize measurement history for each node
@@ -193,7 +201,7 @@ z_histories = [np.zeros((window_size, m), dtype=np.float32) for _ in range(num_n
 # Initialize TensorFlow MSE loss function
 mse_loss_fn = MeanSquaredError()
 
-# Simulation loop with LSTM-based Q and R prediction
+# Simulation loop with LSTM-based Q, R, and delta prediction
 for k in range(1, len(t)):
     for node in range(num_nodes):
         sensor_pos = sensor_positions[k][node]
@@ -211,12 +219,13 @@ for k in range(1, len(t)):
         if k % 50 == 0:
             epochs = 10  # Increase epochs for better training
             early_stopping = EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
-            lstm_model.fit(z_input, np.zeros((1, n + m)), epochs=epochs, callbacks=[early_stopping], verbose=1)
+            lstm_model.fit(z_input, np.zeros((1, n + m + m)), epochs=epochs, callbacks=[early_stopping], verbose=1)
 
-        # Predict Q and R
+        # Predict Q, R, and delta
         lstm_output = lstm_model.predict(z_input, verbose=0)
         q_diag = np.exp(lstm_output[0][:n])
-        r_diag = np.exp(lstm_output[0][n:])
+        r_diag = np.exp(lstm_output[0][n:n + m])
+        delta = np.exp(lstm_output[0][n + m:])
         Q_pred = np.diag(q_diag)
         R_pred = np.diag(r_diag)
 
@@ -225,12 +234,13 @@ for k in range(1, len(t)):
         if k > 1:
             Q_pred = alpha * Q_pred + (1 - alpha) * previous_Q_pred
             R_pred = alpha * R_pred + (1 - alpha) * previous_R_pred
-        previous_Q_pred, previous_R_pred = Q_pred, R_pred
+            delta = alpha * delta + (1 - alpha) * previous_delta
+        previous_Q_pred, previous_R_pred, previous_delta = Q_pred, R_pred, delta
 
-        # Perform EKF update with predicted Q and R
+        # Perform EKF update with predicted Q, R, and delta
         x_updated, P_updated, z_pred = ekf(
             x_kf[:, k-1, node], z_node, P_kf[node], Q_pred, R_pred,
-            satellite_motion_model, measurement_model, sensor_pos
+            satellite_motion_model, measurement_model, sensor_pos, delta
         )
 
         # Compute loss (mean squared error between predicted and actual measurements)
