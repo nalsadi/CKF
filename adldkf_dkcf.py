@@ -218,93 +218,54 @@ squared_error_kf = torch.zeros((n, len(t), num_nodes), dtype=torch.float32, devi
 for node in range(num_nodes):
     x_kf[:, 0, node] = torch.tensor(x0_true, dtype=torch.float32, device=device) + torch.randn(n, device=device) * 0.1
 
-# Kalman Filter functions
-def kf_predict(x, u, P, Q, dt):
-    # Predict satellite state using motion model
-    x_pred = satellite_motion_model(x.unsqueeze(0), dt).squeeze(0)
-    
-    # Approximate the state transition matrix numerically
-    F = torch.zeros((n, n), device=device)
+def sigmoid_saturation(innov, delta, alpha=1.0):
+    return 1 / (1 + torch.exp(-alpha * (innov.abs() - delta)))
+
+# Extended Kalman Filter (EKF) function
+def ssif_ekf(x, z, P, Q, R, delta, motion_model, measurement_model, sensor_pos):
+    """
+    Extended Kalman Filter (EKF) combining prediction and update stages.
+    x: state vector
+    z: measurement vector
+    P: error covariance matrix
+    Q: process noise covariance
+    R: measurement noise covariance
+    delta: sliding layer widths
+    motion_model: function for state transition
+    measurement_model: function for measurement prediction
+    sensor_pos: sensor position for measurement model
+    """
+    n = x.shape[0]
+    m = z.shape[0]
+    delta = torch.tensor(delta, requires_grad=False)  # Sliding layer widths
+
+    # Prediction stage
+    x_pred = motion_model(x, dt)  # Predict state
+    F = torch.zeros((n, n), device=x.device)  # State transition Jacobian
     epsilon = 1e-4
-    
     for j in range(n):
         x_perturbed = x.clone()
         x_perturbed[j] += epsilon
-        x_perturbed_next = satellite_motion_model(x_perturbed.unsqueeze(0), dt).squeeze(0)
-        F[:, j] = (x_perturbed_next - x_pred) / epsilon
-        
-    P_pred = F @ P @ F.T + Q
-    
-    return x_pred, P_pred, F
+        F[:, j] = (motion_model(x_perturbed, dt) - x_pred) / epsilon
+    P_pred = F @ P @ F.T + Q  # Predict error covariance
 
-def kf_update(x_pred, z, P_pred, R, sensor_pos):
-    # Get measurement prediction
-    z_pred = measurement_model(x_pred.unsqueeze(0), sensor_pos.unsqueeze(0)).squeeze(0)
-    
-    # Calculate Jacobian
-    H = torch.zeros((m, n), device=device)
-    epsilon = 1e-4
-    
+    # Update stage
+    z_pred = measurement_model(x_pred, sensor_pos)  # Predicted measurement
+    H = torch.zeros((m, n), device=x.device)  # Measurement Jacobian
     for j in range(n):
         x_perturbed = x_pred.clone()
         x_perturbed[j] += epsilon
-        z_perturbed = measurement_model(x_perturbed.unsqueeze(0), sensor_pos.unsqueeze(0)).squeeze(0)
-        H[:, j] = (z_perturbed - z_pred) / epsilon
-    
-    # Calculate innovation
-    y = z - z_pred
-    
-    # Wrap angle differences to [-pi, pi]
-    y[1:3] = torch.atan2(torch.sin(y[1:3]), torch.cos(y[1:3]))
-    
-    S = H @ P_pred @ H.T + R
-    K = P_pred @ H.T @ torch.linalg.pinv(S)
-    x_updated = x_pred + K @ y
-    P_updated = (torch.eye(n, device=device) - K @ H) @ P_pred
-    
+        H[:, j] = (measurement_model(x_perturbed, sensor_pos) - z_pred) / epsilon
+    innov = z - z_pred  # Innovation
+    innov[1:3] = torch.atan2(torch.sin(innov[1:3]), torch.cos(innov[1:3]))  # Wrap angles to [-pi, pi]
+
+    sat = sigmoid_saturation(innov, delta, alpha=1.0)  # Saturation terms
+    S = H @ P_pred @ H.T + R  # Innovation covariance
+    K = P_pred @ H.T @ torch.linalg.pinv(S)  # Kalman gain
+    x_updated = x_pred + K @ (sat * innov)  # Update state estimate
+    P_updated = (torch.eye(n, device=x.device) - K @ H) @ P_pred  # Update error covariance
+
     return x_updated, P_updated, z_pred
-
-def sigmoid_saturation(innov, delta, alpha=1.0):
-    return 1 / (1 + torch.exp(-alpha * (torch.abs(innov) - delta)))
-
-def ssf_update(x_pred, z, P_pred, R, sensor_pos, delta):
-    # Get measurement prediction
-    z_pred = measurement_model(x_pred.unsqueeze(0), sensor_pos.unsqueeze(0)).squeeze(0)
-    
-    # Calculate Jacobian
-    H = torch.zeros((m, n), device=device)
-    epsilon = 1e-4
-    
-    for j in range(n):
-        x_perturbed = x_pred.clone()
-        x_perturbed[j] += epsilon
-        z_perturbed = measurement_model(x_perturbed.unsqueeze(0), sensor_pos.unsqueeze(0)).squeeze(0)
-        H[:, j] = (z_perturbed - z_pred) / epsilon
-    
-    # Calculate innovation
-    y = z - z_pred
-
-    # Wrap angle differences to [-pi, pi]
-    y[1:3] = torch.atan2(torch.sin(y[1:3]), torch.cos(y[1:3]))
-    
-    S = H @ P_pred @ H.T + R
-
-    innov = y
-    sat = sigmoid_saturation(innov, delta, alpha=0.5)
-    
-    K = P_pred @ H.T @ torch.linalg.pinv(S)
-
-    x_updated = x_pred + K @ (sat * innov)
-    P_updated = (torch.eye(n, device=device) - K @ H) @ P_pred
-    
-    return x_updated, P_updated, z_pred
-
-# Use predefined Q and R as initial values
-Q = Q.clone()
-R = R.clone()
-R_list = [R.clone() for _ in range(num_nodes)]
-Q_opts = [Q.clone() for _ in range(num_nodes)]
-R_opts = [R.clone() for _ in range(num_nodes)]
 
 # Generate true satellite trajectory
 for k in range(1, len(t)):
@@ -387,9 +348,7 @@ for k in range(1, len(t)):
 
                 # Forward pass through filter
                 x_prev = x_kf[:, k-1, node].clone().detach().requires_grad_(True)
-                x_pred, P_pred, _ = kf_predict(x_prev, None, P_kf[node], Q_opt, dt)
-                # Pass learned delta to ssf_update
-                x_updated, _, z_pred = ssf_update(x_pred, z_node, P_pred, R_opt, sensor_pos, delta=delta)
+                x_updated, P_updated, z_pred = ssif_ekf(x_prev, z_node, P_kf[node], Q_opt, R_opt, delta, satellite_motion_model, measurement_model, sensor_pos)
 
                 # Compute and backpropagate loss
                 loss = criterion(z_pred, z_node)
@@ -413,8 +372,10 @@ for k in range(1, len(t)):
                         print(f"Gradient for {name}: {param.grad.norm().item()}")
             exit()
         # Regular filter update using current optimal parameters
-        x_pred_adldkf, P_pred_adldkf, _ = kf_predict(x_kf[:, k-1, node], None, P_kf[node], Q_opts[node], dt)
-        x_kf[:, k, node], P_kf[node], _ = ssf_update(x_pred_adldkf, z_node, P_pred_adldkf, R_opts[node], sensor_pos, delta=delta_opts[node])
+        x_kf[:, k, node], P_kf[node], _ = ssif_ekf(
+            x_kf[:, k-1, node], z_node, P_kf[node], Q_opts[node], R_opts[node], 
+            delta_opts[node], satellite_motion_model, measurement_model, sensor_pos
+        )
 
     # Consensus step for ADL-DKF using averaged model weights
     if k % 10 == 0:  # Perform weight averaging every 10 steps
