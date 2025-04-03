@@ -182,9 +182,9 @@ optimizers = []
 criterions = []
 for _ in range(num_nodes):
     # Change output_dim to n + m + m to include Q diag, R diag, and delta per measurement
-    model = LSTMEstimator(input_dim=m, hidden_dim=32, output_dim=n+m+m).to(device)
+    model = LSTMEstimator(input_dim=m, hidden_dim=32*10, output_dim=n+m+m).to(device)
     lstm_models.append(model)
-    optimizers.append(optim.RMSprop(model.parameters(), lr=1e-3))
+    optimizers.append(optim.RMSprop(model.parameters(), lr=1e-1))
     criterions.append(nn.MSELoss())
 
 # Define the sliding window size
@@ -303,7 +303,7 @@ def ssf_update(x_pred, z, P_pred, R, sensor_pos, delta):
     S = H @ P_pred @ H.T + R
 
     innov = y
-    sat = sigmoid_saturation(innov, delta, alpha=1.0)
+    sat = sigmoid_saturation(innov, delta, alpha=0.5)
     
     K = P_pred @ H.T @ torch.linalg.pinv(S)
 
@@ -499,7 +499,7 @@ for k in range(1, len(t)):
         z_node_histories[node][:, -1] = z_node
 
         # LSTM parameter updates (every 10 steps)
-        if k % 10 == 0 and k > window_size:
+        if k % 10 == 0:  # and k > window_size:
             optimizer = optimizers[node]
             lstm_model = lstm_models[node]
             criterion = criterions[node]
@@ -538,6 +538,10 @@ for k in range(1, len(t)):
                 loss = criterion(z_pred, z_node)
                 print(f"Node {node+1}, Epoch {epoch+1}, Loss: {loss.item()}, Delta: {delta}")
                 loss.backward()
+
+                # Gradient clipping to prevent exploding gradients
+                torch.nn.utils.clip_grad_norm_(lstm_model.parameters(), max_norm=1.0)
+
                 optimizer.step()
 
                 # Update filter parameters
@@ -546,14 +550,32 @@ for k in range(1, len(t)):
                     R_opts[node] = R_opt.detach()
                     delta_opts[node] = delta  # Save the delta values (one per measurement)
 
+                # Debugging: Check gradients
+                for name, param in lstm_model.named_parameters():
+                    if param.grad is not None:
+                        print(f"Gradient for {name}: {param.grad.norm().item()}")
+
         # Regular filter update using current optimal parameters
         x_pred_adldkf, P_pred_adldkf, _ = kf_predict(x_kf[:, k-1, node], None, P_kf[node], Q_opts[node], dt)
         x_kf[:, k, node], P_kf[node], _ = ssf_update(x_pred_adldkf, z_node, P_pred_adldkf, R_opts[node], sensor_pos, delta=delta_opts[node])
 
-    # Consensus step for ADL-DKF using mean of all nodes
+    # Consensus step for ADL-DKF using averaged model weights
+    if k % 10 == 0:  # Perform weight averaging every 10 steps
+        # Average LSTM model weights across all nodes
+        with torch.no_grad():
+            for param_name in lstm_models[0].state_dict().keys():
+                # Compute the average of the parameter across all models
+                avg_param = torch.mean(
+                    torch.stack([lstm_models[node].state_dict()[param_name] for node in range(num_nodes)]), dim=0
+                )
+                # Update each model with the averaged parameter
+                for node in range(num_nodes):
+                    lstm_models[node].state_dict()[param_name].copy_(avg_param)
+
+    # Compute the mean state across all nodes
     mean_state = torch.mean(x_kf[:, k, :], dim=1)  # Mean across all nodes
     mean_P = torch.mean(torch.stack([P_kf[i] for i in range(num_nodes)]), dim=0)
-    
+
     # Update all nodes with consensus state
     for node in range(num_nodes):
         x_kf[:, k, node] = mean_state
