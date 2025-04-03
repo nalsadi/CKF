@@ -160,31 +160,38 @@ for node in range(num_nodes):
 #import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM as KerasLSTM, Dense
+from tensorflow.keras.layers import LSTM as KerasLSTM, Dense, Dropout
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import MeanSquaredError
+from tensorflow.keras.callbacks import EarlyStopping
 import matplotlib.pyplot as plt
 
 # Use the existing variables from user's environment
 # t, n, m, num_nodes, z, z_histories, sensor_positions, x_kf, P_kf, satellite_motion_model,
 # measurement_model, ekf, x, state_names
 
-# Define LSTM model creation
+# Define LSTM model creation with dropout
 def create_lstm_model(input_shape, hidden_dim, output_dim):
     model = Sequential([
         KerasLSTM(hidden_dim, input_shape=input_shape, return_sequences=False),
+        Dropout(0.2),  # Add dropout to prevent overfitting
         Dense(output_dim)
     ])
     model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
     return model
 
 # Initialize LSTM models for each node
-input_shape = (10, m)  # 10 time steps, m features per step
-hidden_dim = 32
+window_size = 50
+input_shape = (window_size, m)  # 10 time steps, m features per step
+hidden_dim = 32*4
 output_dim = n + m  # Predict Q (n values) and R (m values)
 lstm_models = [create_lstm_model(input_shape, hidden_dim, output_dim) for _ in range(num_nodes)]
 
 # Initialize measurement history for each node
-z_histories = [np.zeros((10, m), dtype=np.float32) for _ in range(num_nodes)]
+z_histories = [np.zeros((window_size, m), dtype=np.float32) for _ in range(num_nodes)]
+
+# Initialize TensorFlow MSE loss function
+mse_loss_fn = MeanSquaredError()
 
 # Simulation loop with LSTM-based Q and R prediction
 for k in range(1, len(t)):
@@ -196,14 +203,15 @@ for k in range(1, len(t)):
         z_histories[node][:-1] = z_histories[node][1:]
         z_histories[node][-1] = z_node
 
-        # Prepare input for LSTM (shape: 1 x 10 x m)
-        z_input = z_histories[node].reshape(1, 10, m).astype(np.float32)
+        # Prepare input for LSTM (shape: 1 x window_size x m)
+        z_input = z_histories[node].reshape(1, window_size, m).astype(np.float32)
         lstm_model = lstm_models[node]
 
-        # Train LSTM model for multiple epochs
-        epochs = 5  # Number of epochs for training
-        batch_size = 1
-        lstm_model.fit(z_input, np.zeros((1, n + m)), epochs=epochs, batch_size=batch_size, verbose=1)
+        # Train LSTM model every 10 steps with early stopping
+        if k % 50 == 0:
+            epochs = 10  # Increase epochs for better training
+            early_stopping = EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
+            lstm_model.fit(z_input, np.zeros((1, n + m)), epochs=epochs, callbacks=[early_stopping], verbose=1)
 
         # Predict Q and R
         lstm_output = lstm_model.predict(z_input, verbose=0)
@@ -212,6 +220,13 @@ for k in range(1, len(t)):
         Q_pred = np.diag(q_diag)
         R_pred = np.diag(r_diag)
 
+        # Smooth predictions using exponential smoothing
+        alpha = 0.8  # Smoothing factor
+        if k > 1:
+            Q_pred = alpha * Q_pred + (1 - alpha) * previous_Q_pred
+            R_pred = alpha * R_pred + (1 - alpha) * previous_R_pred
+        previous_Q_pred, previous_R_pred = Q_pred, R_pred
+
         # Perform EKF update with predicted Q and R
         x_updated, P_updated, z_pred = ekf(
             x_kf[:, k-1, node], z_node, P_kf[node], Q_pred, R_pred,
@@ -219,7 +234,7 @@ for k in range(1, len(t)):
         )
 
         # Compute loss (mean squared error between predicted and actual measurements)
-        loss = np.mean((z_pred - z_node) ** 2)
+        loss = mse_loss_fn(z_node, z_pred).numpy()
         print(f"Time Step: {k}, Node: {node}, Loss: {loss:.6f}")
 
         # Update states
@@ -232,15 +247,81 @@ for k in range(1, len(t)):
     for node in range(num_nodes):
         x_kf[:, k, node] = mean_state
         P_kf[node] = mean_P
-
-# Compute squared error
-squared_error_kf = (x[:, :, None] - x_kf) ** 2
+        squared_error_kf[:, k, node] = (x[:, k] - mean_state)**2  # Compute squared error during consensus
 
 # Compute RMSE
 rmse_adldkf_total = np.sqrt(np.sum(np.mean(squared_error_kf, axis=2), axis=0))
 rmse_adldkf_state = np.sqrt(np.mean(squared_error_kf, axis=(0, 2)))
 
+# Correct overall RMSE calculation
+overall_rmse = np.sqrt(np.mean(np.mean(squared_error_kf, axis=2), axis=1))
 
-# Print overall RMSE for the estimate
-overall_rmse = np.sqrt(np.mean(squared_error_kf))
-print(f"\nOverall RMSE for the estimate: {overall_rmse:.6f}")
+# Print overall RMSE as an array or scalar
+print(f"\nOverall RMSE for the estimate (per state): {overall_rmse}")
+print(f"Mean Overall RMSE: {np.mean(overall_rmse):.6f}")
+
+# Visualization of results
+plt.figure(figsize=(15, 12))
+
+# Satellite Trajectory
+plt.subplot(3, 2, 1)
+plt.plot(x[0, 1:], x[2, 1:], 'k-', label='True', linewidth=2)
+plt.plot(np.mean(x_kf[0, 1:, :], axis=1), np.mean(x_kf[2, 1:, :], axis=1), 'r--', label='ADL-DKF', linewidth=1.5)
+plt.xlabel('X Position (km)')
+plt.ylabel('Y Position (km)')
+plt.title('Satellite Trajectory')
+plt.legend()
+plt.grid(True)
+
+# X Position Error
+plt.subplot(3, 2, 2)
+plt.plot(t[1:], x[0, 1:] - np.mean(x_kf[0, 1:, :], axis=1), 'r--', label='ADL-DKF')
+plt.xlabel('Time (sec)')
+plt.ylabel('X Position Error (km)')
+plt.title('X Position Error')
+plt.legend()
+plt.grid(True)
+
+# Y Position Error
+plt.subplot(3, 2, 3)
+plt.plot(t[1:], x[2, 1:] - np.mean(x_kf[2, 1:, :], axis=1), 'r--', label='ADL-DKF')
+plt.xlabel('Time (sec)')
+plt.ylabel('Y Position Error (km)')
+plt.title('Y Position Error')
+plt.legend()
+plt.grid(True)
+
+# Velocity Estimation
+plt.subplot(3, 2, 4)
+true_vel = np.sqrt(x[1, :]**2 + x[3, :]**2)
+plt.plot(t, true_vel, 'k-', label='True Velocity', linewidth=2)
+adldkf_vel = np.sqrt(np.mean(x_kf[1, :, :], axis=1)**2 + np.mean(x_kf[3, :, :], axis=1)**2)
+plt.plot(t, adldkf_vel, 'r--', label='ADL-DKF')
+plt.xlabel('Time (sec)')
+plt.ylabel('Velocity (km/s)')
+plt.title('Velocity Estimation')
+plt.legend()
+plt.grid(True)
+
+# Total RMSE Over Time
+plt.subplot(3, 2, 5)
+plt.plot(t[1:], rmse_adldkf_total[1:], 'r-', label='ADL-DKF')
+plt.xlabel('Time (sec)')
+plt.ylabel('Total RMSE')
+plt.title('Total RMSE Over Time')
+plt.legend()
+plt.grid(True)
+
+# Mean RMSE Over Time
+plt.subplot(3, 2, 6)
+plt.plot(t[1:], rmse_adldkf_state[1:], 'r-', label='ADL-DKF')
+plt.xlabel('Time (sec)')
+plt.ylabel('Mean RMSE')
+plt.title('Mean RMSE Over Time')
+plt.legend()
+plt.grid(True)
+
+# Adjust layout and save the figure
+plt.tight_layout()
+plt.savefig('satellite_tracking_results_numpy.png', dpi=300)
+plt.show()
