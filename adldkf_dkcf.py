@@ -4,17 +4,17 @@ import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+import tensorflow as tf
 
 # Set seeds for reproducibility
 seed = 42  # You can choose any integer value
 np.random.seed(seed)
 torch.manual_seed(seed)
 
-
 # Simulation parameters
-tf = 200  # Final time in simulation (seconds)
+tff = 200  # Final time in simulation (seconds)
 dt = 0.7  # Sample rate (seconds)
-t = np.arange(0, tf + dt, dt)  # Time vector
+t = np.arange(0, tff + dt, dt)  # Time vector
 n = 4  # Number of states [x, vx, y, vy]
 m = 3  # Number of measurements [range, azimuth, elevation]
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -165,27 +165,31 @@ def measurement_model(x, sensor_pos):
     
     return torch.stack([r, psi, theta], dim=-1)
 
-# Define LSTM for parameter estimation
-class LSTMEstimator(nn.Module):
+# Replace LSTM class with TensorFlow LSTM and add loss tracking
+class LSTMEstimator(tf.keras.Model):
     def __init__(self, input_dim, hidden_dim, output_dim):
         super(LSTMEstimator, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, output_dim)
+        self.lstm = tf.keras.layers.LSTM(hidden_dim, return_sequences=False)
+        self.fc = tf.keras.layers.Dense(output_dim)
+        # Add loss tracking
+        self.loss_tracker = tf.keras.metrics.Mean(name='loss')
 
-    def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        return self.fc(lstm_out[:, -1, :])
+    def call(self, x, training=False):
+        lstm_out = self.lstm(x, training=training)
+        return self.fc(lstm_out)
 
-# Initialize LSTM models and optimizers for each node
+    @property
+    def metrics(self):
+        return [self.loss_tracker]
+
+# Initialize LSTM models for each node
 lstm_models = []
 optimizers = []
-criterions = []
 for _ in range(num_nodes):
     # Change output_dim to n + m + m to include Q diag, R diag, and delta per measurement
-    model = LSTMEstimator(input_dim=m, hidden_dim=32*10, output_dim=n+m+m).to(device)
+    model = LSTMEstimator(input_dim=m, hidden_dim=32*10, output_dim=n+m+m)
     lstm_models.append(model)
-    optimizers.append(optim.RMSprop(model.parameters(), lr=1e-1))
-    criterions.append(nn.MSELoss())
+    optimizers.append(tf.keras.optimizers.RMSprop(learning_rate=1e-1))
 
 # Define the sliding window size
 window_size = 50
@@ -201,7 +205,6 @@ delta_opts = [torch.ones(m, dtype=torch.float32, device=device) * 0.01 for _ in 
 
 # Add DKCF parameters
 N = num_nodes  # Number of nodes for DKCF
-#c = 0.1  # Consensus gain
 
 # Initialize variables for tracking
 x = torch.zeros((n, len(t)), dtype=torch.float32, device=device)
@@ -499,61 +502,77 @@ for k in range(1, len(t)):
         z_node_histories[node][:, -1] = z_node
 
         # LSTM parameter updates (every 10 steps)
-        if k % 10 == 0:  # and k > window_size:
+        if k % 10 == 0:
             optimizer = optimizers[node]
             lstm_model = lstm_models[node]
-            criterion = criterions[node]
 
             # Run standard training epochs for all nodes
             training_epochs = 10
             
             for epoch in range(training_epochs):
-                optimizer.zero_grad()
-
                 # Process measurement history
-                z_input_tensor = z_node_histories[node].T  # Shape: [window_size, m]
-                z_input_tensor_normalized = (z_input_tensor - torch.mean(z_input_tensor, dim=0)) / (torch.std(z_input_tensor, dim=0) + 1e-8)
-                z_input_tensor_normalized = z_input_tensor_normalized.unsqueeze(0)
+                z_input_tensor = z_node_histories[node].T.cpu().numpy()  # Shape: [window_size, m]
+                z_input_tensor_normalized = (z_input_tensor - np.mean(z_input_tensor, axis=0)) / (np.std(z_input_tensor, axis=0) + 1e-8)
+                z_input_tensor_normalized = z_input_tensor_normalized[np.newaxis, ...]
+                z_input_tensor_normalized = tf.convert_to_tensor(z_input_tensor_normalized, dtype=tf.float32)
+                z_node_tensor = tf.convert_to_tensor(z_node.cpu().numpy(), dtype=tf.float32)
 
-                # LSTM forward pass and parameter extraction
-                lstm_output = lstm_model(z_input_tensor_normalized)
-                # Extract first n elements for Q diagonal
-                q_diag = torch.nn.functional.softplus(lstm_output[:, :n])
-                # Extract next m elements for R diagonal
-                r_diag = torch.nn.functional.softplus(lstm_output[:, n:n+m])
-                # Extract delta parameters (one per measurement)
-                delta_out = torch.nn.functional.softplus(lstm_output[:, n+m:])
-                delta = delta_out.squeeze(0)  # Shape: [m]
+                # TF GradientTape for automatic differentiation
+                with tf.GradientTape() as tape:
+                    # Ensure model is in training mode
+                    lstm_output = lstm_model(z_input_tensor_normalized, training=True)
+                    
+                    # Extract parameters with gradients tracked
+                    q_diag = tf.nn.softplus(lstm_output[0, :n])
+                    r_diag = tf.nn.softplus(lstm_output[0, n:n+m])
+                    delta = tf.nn.softplus(lstm_output[0, n+m:])
 
-                Q_opt = torch.diag_embed(q_diag).squeeze(0)
-                R_opt = torch.diag_embed(r_diag).squeeze(0)
+                    Q_opt = tf.linalg.diag(q_diag)
+                    R_opt = tf.linalg.diag(r_diag)
 
-                # Forward pass through filter
-                x_prev = x_kf[:, k-1, node].clone().detach().requires_grad_(True)
-                x_pred, P_pred, _ = kf_predict(x_prev, None, P_kf[node], Q_opt, dt)
-                # Pass learned delta to ssf_update
-                x_updated, _, z_pred = ssf_update(x_pred, z_node, P_pred, R_opt, sensor_pos, delta=delta)
+                    # Forward pass through filter (convert tensors as needed)
+                    x_prev = x_kf[:, k-1, node].clone().detach()
+                    x_pred, P_pred, _ = kf_predict(x_prev, None, P_kf[node], 
+                                                 torch.tensor(Q_opt.numpy(), device=device), dt)
+                    
+                    # Pass learned delta to ssf_update
+                    x_updated, _, z_pred = ssf_update(x_pred, z_node, P_pred, 
+                                                    torch.tensor(R_opt.numpy(), device=device), 
+                                                    sensor_pos, 
+                                                    delta=torch.tensor(delta.numpy(), device=device))
 
-                # Compute and backpropagate loss
-                loss = criterion(z_pred, z_node)
-                print(f"Node {node+1}, Epoch {epoch+1}, Loss: {loss.item()}, Delta: {delta}")
-                loss.backward()
+                    # Compute loss ensuring it's connected to the computation graph
+                    pred_error = tf.convert_to_tensor(z_pred.cpu().numpy(), dtype=tf.float32) - z_node_tensor
+                    loss = tf.reduce_mean(tf.square(pred_error))
+                    
+                    # Add regularization to prevent extreme values
+                    reg_term = 0.01 * (tf.reduce_mean(tf.square(q_diag)) + 
+                                     tf.reduce_mean(tf.square(r_diag)) + 
+                                     tf.reduce_mean(tf.square(delta)))
+                    total_loss = loss + reg_term
 
-                # Gradient clipping to prevent exploding gradients
-                torch.nn.utils.clip_grad_norm_(lstm_model.parameters(), max_norm=1.0)
+                # Compute gradients
+                grads = tape.gradient(total_loss, lstm_model.trainable_variables)
+                
+                # Debug gradient computation
+                if any(g is None for g in grads):
+                    print("Warning: Some gradients are None!")
+                    continue
+                
+                # Clip and apply gradients
+                clipped_grads, _ = tf.clip_by_global_norm(grads, 1.0)
+                optimizer.apply_gradients(zip(clipped_grads, lstm_model.trainable_variables))
 
-                optimizer.step()
+                # Update loss tracker
+                lstm_model.loss_tracker.update_state(total_loss)
+                
+                print(f"Node {node+1}, Epoch {epoch+1}, Loss: {total_loss.numpy():.6f}, Delta: {delta.numpy()}")
 
                 # Update filter parameters
                 with torch.no_grad():
-                    Q_opts[node] = Q_opt.detach()
-                    R_opts[node] = R_opt.detach()
-                    delta_opts[node] = delta  # Save the delta values (one per measurement)
-
-                # Debugging: Check gradients
-                for name, param in lstm_model.named_parameters():
-                    if param.grad is not None:
-                        print(f"Gradient for {name}: {param.grad.norm().item()}")
+                    Q_opts[node] = torch.tensor(Q_opt.numpy(), device=device)
+                    R_opts[node] = torch.tensor(R_opt.numpy(), device=device)
+                    delta_opts[node] = torch.tensor(delta.numpy(), device=device)
 
         # Regular filter update using current optimal parameters
         x_pred_adldkf, P_pred_adldkf, _ = kf_predict(x_kf[:, k-1, node], None, P_kf[node], Q_opts[node], dt)
@@ -561,16 +580,32 @@ for k in range(1, len(t)):
 
     # Consensus step for ADL-DKF using averaged model weights
     if k % 10 == 0:  # Perform weight averaging every 10 steps
-        # Average LSTM model weights across all nodes
-        with torch.no_grad():
-            for param_name in lstm_models[0].state_dict().keys():
-                # Compute the average of the parameter across all models
-                avg_param = torch.mean(
-                    torch.stack([lstm_models[node].state_dict()[param_name] for node in range(num_nodes)]), dim=0
-                )
-                # Update each model with the averaged parameter
-                for node in range(num_nodes):
-                    lstm_models[node].state_dict()[param_name].copy_(avg_param)
+        # Collect all model variables
+        all_lstm_vars = []
+        all_fc_vars = []
+        
+        # Split variables by layer (LSTM and Dense)
+        for model in lstm_models:
+            lstm_vars = model.lstm.trainable_variables
+            fc_vars = model.fc.trainable_variables
+            all_lstm_vars.append(lstm_vars)
+            all_fc_vars.append(fc_vars)
+        
+        # Average LSTM layer weights
+        for i in range(len(all_lstm_vars[0])):  # For each LSTM variable
+            var_stack = tf.stack([vars[i] for vars in all_lstm_vars])
+            avg_var = tf.reduce_mean(var_stack, axis=0)
+            # Update all models with averaged weights
+            for model_idx in range(num_nodes):
+                all_lstm_vars[model_idx][i].assign(avg_var)
+        
+        # Average Dense layer weights
+        for i in range(len(all_fc_vars[0])):  # For each Dense variable
+            var_stack = tf.stack([vars[i] for vars in all_fc_vars])
+            avg_var = tf.reduce_mean(var_stack, axis=0)
+            # Update all models with averaged weights
+            for model_idx in range(num_nodes):
+                all_fc_vars[model_idx][i].assign(avg_var)
 
     # Compute the mean state across all nodes
     mean_state = torch.mean(x_kf[:, k, :], dim=1)  # Mean across all nodes
@@ -621,7 +656,6 @@ for k in range(1, len(t)):
         ukf_states[i, k, :] = mean_state_ukf
         P_ukf[i] = mean_P_ukf
         squared_error_ukf[:, k, i] = (x[:, k] - mean_state_ukf)**2
-
 
 # Compute RMSE per state over time (using consensus states)
 rmse_adldkf_state = torch.sqrt(torch.mean(squared_error_kf, dim=(0, 2)))  # Mean across states and nodes
