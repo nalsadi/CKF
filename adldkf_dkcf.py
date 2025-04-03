@@ -188,11 +188,25 @@ optimizers = []
 criterions = []
 for _ in range(num_nodes):
     # Change input_dim to m * window_size to match the flattened input
-    model = SimpleNNEstimator(input_dim=m * window_size, hidden_dim=32, output_dim=n+m+m).to(device)
+    model = SimpleNNEstimator(input_dim=m * window_size, hidden_dim=32*4, output_dim=n+m+m).to(device)
+    
+    # Improve weight initialization
+    def init_weights(m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            nn.init.zeros_(m.bias)
+    model.apply(init_weights)
+    
     nn_models.append(model)
-    optimizers.append(optim.RMSprop(model.parameters(), lr=1e-1))
-    criterions.append(nn.MSELoss())
 
+# Adjust learning rate and add regularization
+optimizers = [
+    optim.RMSprop(model.parameters(), lr=1e-4, weight_decay=1e-5)  # Reduce learning rate and add weight decay
+    for model in nn_models
+]
+
+# Use SmoothL1Loss instead of MSELoss
+criterions = [nn.SmoothL1Loss() for _ in range(num_nodes)]  # More robust loss function
 
 # Initialize measurement history for each node
 z_node_histories = [torch.zeros((m, window_size), dtype=torch.float32, device=device) for _ in range(num_nodes)]
@@ -241,7 +255,7 @@ def ssif_ekf(x, z, P, Q, R, delta, motion_model, measurement_model, sensor_pos):
     """
     n = x.shape[0]
     m = z.shape[0]
-    delta = torch.tensor(delta, requires_grad=False)  # Sliding layer widths
+    delta = delta.clone().detach()  # Sliding layer widths
 
     # Prediction stage
     x_pred = motion_model(x, dt)  # Predict state
@@ -263,7 +277,7 @@ def ssif_ekf(x, z, P, Q, R, delta, motion_model, measurement_model, sensor_pos):
     innov = z - z_pred  # Innovation
     innov[1:3] = torch.atan2(torch.sin(innov[1:3]), torch.cos(innov[1:3]))  # Wrap angles to [-pi, pi]
 
-    sat = sigmoid_saturation(innov, delta, alpha=1.0)  # Saturation terms
+    sat = sigmoid_saturation(innov, delta, alpha=0.7)  # Saturation terms
     S = H @ P_pred @ H.T + R  # Innovation covariance
     K = P_pred @ H.T @ torch.linalg.pinv(S)  # Kalman gain
     x_updated = x_pred + K @ (sat * innov)  # Update state estimate
@@ -337,27 +351,32 @@ for k in range(1, len(t)):
                 z_input_tensor_normalized = (z_input_tensor - torch.mean(z_input_tensor, dim=0)) / (torch.std(z_input_tensor, dim=0) + 1e-8)
                 z_input_tensor_normalized = z_input_tensor_normalized.flatten().unsqueeze(0)  # Flatten for NN input
 
-                # NN forward pass and parameter extraction
+                # Add Gaussian noise for variability
+                noise = torch.randn_like(z_input_tensor_normalized) * 0.01
+                z_input_tensor_normalized = z_input_tensor_normalized + noise  # Avoid in-place operation
+
+                # Forward pass
                 nn_output = nn_model(z_input_tensor_normalized)
-                # Extract first n elements for Q diagonal
-                q_diag = torch.nn.functional.softplus(nn_output[:, :n])
-                # Extract next m elements for R diagonal
-                r_diag = torch.nn.functional.softplus(nn_output[:, n:n+m])
-                # Extract delta parameters (one per measurement)
-                delta_out = torch.nn.functional.softplus(nn_output[:, n+m:])
-                delta = delta_out.squeeze(0)  # Shape: [m]
 
-                Q_opt = torch.diag_embed(q_diag).squeeze(0)
-                R_opt = torch.diag_embed(r_diag).squeeze(0)
+                # Debugging: Attach gradient hooks to intermediate tensors
+                #def hook_fn(grad):
+                 #   print(f"Gradient at intermediate tensor: {grad}")
+                #nn_output.register_hook(hook_fn)
 
-                # Forward pass through filter
-                x_prev = x_kf[:, k-1, node].clone().detach().requires_grad_(True)
-                x_updated, P_updated, z_pred = ssif_ekf(x_prev, z_node, P_kf[node], Q_opt, R_opt, delta, satellite_motion_model, measurement_model, sensor_pos)
+                # Simplified loss for debugging
+                dummy_target = torch.zeros_like(nn_output)
+                loss = criterion(nn_output, dummy_target)
+                print(f"Node {node}, Epoch {epoch}, Loss: {loss.item()}")
 
-                # Compute and backpropagate loss
-                loss = criterion(z_pred, z_node)
-                print(f"Node {node+1}, Epoch {epoch+1}, Loss: {loss.item()}, Delta: {delta}")
+                # Backward pass
                 loss.backward()
+
+                # Debugging: Check gradients for each parameter
+                #for name, param in nn_model.named_parameters():
+                 #   if param.grad is not None:
+                  #      print(f"Gradient for {name}: {param.grad.norm().item()}")
+                   # else:
+                    #    print(f"Gradient for {name}: None (check for issues)")
 
                 # Gradient clipping to prevent exploding gradients
                 torch.nn.utils.clip_grad_norm_(nn_model.parameters(), max_norm=1.0)
@@ -366,16 +385,10 @@ for k in range(1, len(t)):
 
                 # Update filter parameters
                 with torch.no_grad():
-                   # print(f"Node {node+1}, Epoch {epoch+1}, Q_opt: {Q_opt}, R_opt: {R_opt}")
-                    Q_opts[node] = Q_opt.detach()
-                    R_opts[node] = R_opt.detach()
-                    delta_opts[node] = delta  # Save the delta values (one per measurement)
+                    Q_opts[node] = Q.clone()
+                    R_opts[node] = R.clone()
+                    delta_opts[node] = torch.ones(m, dtype=torch.float32, device=device) * 0.01
 
-                # Debugging: Check gradients
-                for name, param in nn_model.named_parameters():
-                    if param.grad is not None:
-                        print(f"Gradient for {name}: {param.grad.norm().item()}")
-            exit()
         # Regular filter update using current optimal parameters
         x_kf[:, k, node], P_kf[node], _ = ssif_ekf(
             x_kf[:, k-1, node], z_node, P_kf[node], Q_opts[node], R_opts[node], 
