@@ -299,80 +299,12 @@ def ssf_update(x_pred, z, P_pred, R, sensor_pos, delta):
     
     return x_updated, P_updated, z_pred
 
-def optimize_QR(x0, trajectory_length=50):
-    """Simple Q/R optimization using EKF on a short trajectory"""
-    # Generate short test trajectory
-    x_test = torch.zeros((n, trajectory_length), dtype=torch.float32, device=device)
-    x_test[:, 0] = torch.tensor(x0, dtype=torch.float32, device=device)
-    
-    # Generate true trajectory without fault
-    for k in range(1, trajectory_length):
-        x_test[:, k] = satellite_motion_model(x_test[:, k-1].unsqueeze(0), dt).squeeze(0)
-    
-    # Generate measurements
-    z_test = torch.zeros((m, trajectory_length, num_nodes), dtype=torch.float32, device=device)
-    for k in range(trajectory_length):
-        for node in range(num_nodes):
-            sensor_pos = sensor_positions_torch[k][node]
-            true_measurement = measurement_model(x_test[:, k].unsqueeze(0), sensor_pos.unsqueeze(0)).squeeze(0)
-            z_test[:, k, node] = true_measurement
-    
-    # Q/R scaling factors to try
-    q_scales = torch.tensor([0.1, 0.5, 1.0, 2.0, 5.0], device=device)
-    r_scales = torch.tensor([0.1, 0.5, 1.0, 2.0, 5.0], device=device)
-    
-    best_rmse = float('inf')
-    best_Q = None
-    best_R = None
-    
-    # Simple grid search
-    for q_scale in q_scales:
-        for r_scale in r_scales:
-            # Scale base Q and R
-            Q_test = Q * q_scale
-            R_test = R * r_scale
-            
-            # Run EKF with current Q/R
-            x_est = torch.zeros((n, trajectory_length), dtype=torch.float32, device=device)
-            x_est[:, 0] = x_test[:, 0] + torch.randn(n, device=device) * 0.1
-            P_est = torch.eye(n, dtype=torch.float32, device=device)
-            
-            squared_error = torch.zeros((n, trajectory_length), dtype=torch.float32, device=device)
-            
-            for k in range(1, trajectory_length):
-                # Predict
-                x_pred, P_pred, _ = kf_predict(x_est[:, k-1], None, P_est, Q_test, dt)
-                
-                # Update using average of all measurements
-                z_avg = torch.mean(z_test[:, k, :], dim=1)
-                x_updated, P_est, _ = kf_update(x_pred, z_avg, P_pred, R_test, sensor_positions_torch[k][0])
-                x_est[:, k] = x_updated
-                
-                # Calculate error
-                squared_error[:, k] = (x_test[:, k] - x_updated)**2
-            
-            # Calculate RMSE
-            rmse = torch.sqrt(torch.mean(squared_error[:, 1:])).item()
-            
-            if rmse < best_rmse:
-                best_rmse = rmse
-                best_Q = Q_test.clone()
-                best_R = R_test.clone()
-                print(f"New best RMSE: {rmse:.6f} with Q_scale={q_scale:.1f}, R_scale={r_scale:.1f}")
-    
-    return best_Q, best_R, best_rmse
-
-# Run Q/R optimization before main simulation
-print("Optimizing Q and R matrices...")
-Q_opt, R_opt, opt_rmse = optimize_QR(x0_true)
-print(f"Optimization complete. Best RMSE: {opt_rmse:.6f}")
-
-# Use optimized Q and R as initial values
-Q = Q_opt.clone()
-R = R_opt.clone()
-R_list = [R_opt.clone() for _ in range(num_nodes)]
-Q_opts = [Q_opt.clone() for _ in range(num_nodes)]
-R_opts = [R_opt.clone() for _ in range(num_nodes)]
+# Use predefined Q and R as initial values
+Q = Q.clone()
+R = R.clone()
+R_list = [R.clone() for _ in range(num_nodes)]
+Q_opts = [Q.clone() for _ in range(num_nodes)]
+R_opts = [R.clone() for _ in range(num_nodes)]
 
 # Generate true satellite trajectory
 for k in range(1, len(t)):
@@ -479,7 +411,7 @@ for k in range(1, len(t)):
                 for name, param in lstm_model.named_parameters():
                     if param.grad is not None:
                         print(f"Gradient for {name}: {param.grad.norm().item()}")
-
+            exit()
         # Regular filter update using current optimal parameters
         x_pred_adldkf, P_pred_adldkf, _ = kf_predict(x_kf[:, k-1, node], None, P_kf[node], Q_opts[node], dt)
         x_kf[:, k, node], P_kf[node], _ = ssf_update(x_pred_adldkf, z_node, P_pred_adldkf, R_opts[node], sensor_pos, delta=delta_opts[node])
