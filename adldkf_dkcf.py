@@ -165,30 +165,34 @@ def measurement_model(x, sensor_pos):
     
     return torch.stack([r, psi, theta], dim=-1)
 
-# Define LSTM for parameter estimation
-class LSTMEstimator(nn.Module):
+# Define simple NN for parameter estimation
+class SimpleNNEstimator(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
-        super(LSTMEstimator, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, output_dim)
+        super(SimpleNNEstimator, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        return self.fc(lstm_out[:, -1, :])
+        x = self.fc1(x)
+        x = self.relu(x)
+        return self.fc2(x)
 
-# Initialize LSTM models and optimizers for each node
-lstm_models = []
-optimizers = []
-criterions = []
-for _ in range(num_nodes):
-    # Change output_dim to n + m + m to include Q diag, R diag, and delta per measurement
-    model = LSTMEstimator(input_dim=m, hidden_dim=32*10, output_dim=n+m+m).to(device)
-    lstm_models.append(model)
-    optimizers.append(optim.RMSprop(model.parameters(), lr=1e-1))
-    criterions.append(nn.MSELoss())
 
 # Define the sliding window size
 window_size = 50
+
+# Initialize NN models and optimizers for each node
+nn_models = []
+optimizers = []
+criterions = []
+for _ in range(num_nodes):
+    # Change input_dim to m * window_size to match the flattened input
+    model = SimpleNNEstimator(input_dim=m * window_size, hidden_dim=32, output_dim=n+m+m).to(device)
+    nn_models.append(model)
+    optimizers.append(optim.RMSprop(model.parameters(), lr=1e-1))
+    criterions.append(nn.MSELoss())
+
 
 # Initialize measurement history for each node
 z_node_histories = [torch.zeros((m, window_size), dtype=torch.float32, device=device) for _ in range(num_nodes)]
@@ -316,10 +320,10 @@ for k in range(1, len(t)):
         z_node_histories[node] = torch.roll(z_node_histories[node], -1, dims=1)
         z_node_histories[node][:, -1] = z_node
 
-        # LSTM parameter updates (every 10 steps)
+        # NN parameter updates (every 10 steps)
         if k % 10 == 0:  # and k > window_size:
             optimizer = optimizers[node]
-            lstm_model = lstm_models[node]
+            nn_model = nn_models[node]
             criterion = criterions[node]
 
             # Run standard training epochs for all nodes
@@ -331,16 +335,16 @@ for k in range(1, len(t)):
                 # Process measurement history
                 z_input_tensor = z_node_histories[node].T  # Shape: [window_size, m]
                 z_input_tensor_normalized = (z_input_tensor - torch.mean(z_input_tensor, dim=0)) / (torch.std(z_input_tensor, dim=0) + 1e-8)
-                z_input_tensor_normalized = z_input_tensor_normalized.unsqueeze(0)
+                z_input_tensor_normalized = z_input_tensor_normalized.flatten().unsqueeze(0)  # Flatten for NN input
 
-                # LSTM forward pass and parameter extraction
-                lstm_output = lstm_model(z_input_tensor_normalized)
+                # NN forward pass and parameter extraction
+                nn_output = nn_model(z_input_tensor_normalized)
                 # Extract first n elements for Q diagonal
-                q_diag = torch.nn.functional.softplus(lstm_output[:, :n])
+                q_diag = torch.nn.functional.softplus(nn_output[:, :n])
                 # Extract next m elements for R diagonal
-                r_diag = torch.nn.functional.softplus(lstm_output[:, n:n+m])
+                r_diag = torch.nn.functional.softplus(nn_output[:, n:n+m])
                 # Extract delta parameters (one per measurement)
-                delta_out = torch.nn.functional.softplus(lstm_output[:, n+m:])
+                delta_out = torch.nn.functional.softplus(nn_output[:, n+m:])
                 delta = delta_out.squeeze(0)  # Shape: [m]
 
                 Q_opt = torch.diag_embed(q_diag).squeeze(0)
@@ -356,18 +360,19 @@ for k in range(1, len(t)):
                 loss.backward()
 
                 # Gradient clipping to prevent exploding gradients
-                torch.nn.utils.clip_grad_norm_(lstm_model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(nn_model.parameters(), max_norm=1.0)
 
                 optimizer.step()
 
                 # Update filter parameters
                 with torch.no_grad():
+                   # print(f"Node {node+1}, Epoch {epoch+1}, Q_opt: {Q_opt}, R_opt: {R_opt}")
                     Q_opts[node] = Q_opt.detach()
                     R_opts[node] = R_opt.detach()
                     delta_opts[node] = delta  # Save the delta values (one per measurement)
 
                 # Debugging: Check gradients
-                for name, param in lstm_model.named_parameters():
+                for name, param in nn_model.named_parameters():
                     if param.grad is not None:
                         print(f"Gradient for {name}: {param.grad.norm().item()}")
             exit()
@@ -379,16 +384,16 @@ for k in range(1, len(t)):
 
     # Consensus step for ADL-DKF using averaged model weights
     if k % 10 == 0:  # Perform weight averaging every 10 steps
-        # Average LSTM model weights across all nodes
+        # Average NN model weights across all nodes
         with torch.no_grad():
-            for param_name in lstm_models[0].state_dict().keys():
+            for param_name in nn_models[0].state_dict().keys():
                 # Compute the average of the parameter across all models
                 avg_param = torch.mean(
-                    torch.stack([lstm_models[node].state_dict()[param_name] for node in range(num_nodes)]), dim=0
+                    torch.stack([nn_models[node].state_dict()[param_name] for node in range(num_nodes)]), dim=0
                 )
                 # Update each model with the averaged parameter
                 for node in range(num_nodes):
-                    lstm_models[node].state_dict()[param_name].copy_(avg_param)
+                    nn_models[node].state_dict()[param_name].copy_(avg_param)
 
     # Compute the mean state across all nodes
     mean_state = torch.mean(x_kf[:, k, :], dim=1)  # Mean across all nodes
