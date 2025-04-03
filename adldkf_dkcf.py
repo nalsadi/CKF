@@ -239,10 +239,12 @@ for node in range(num_nodes):
 def sigmoid_saturation(innov, delta, alpha=1.0):
     return 1 / (1 + torch.exp(-alpha * (innov.abs() - delta)))
 
-# Extended Kalman Filter (EKF) function
-def ssif_ekf(x, z, P, Q, R, delta, motion_model, measurement_model, sensor_pos):
+# Modified SSIF implementation for nonlinear systems with adaptive features
+def ssif_adaptive(x, z, P, Q, R, delta, motion_model, measurement_model, sensor_pos, criterion):
     """
-    Extended Kalman Filter (EKF) combining prediction and update stages.
+    Extended Kalman Filter with SSIF (Sigmoidal Saturated Increment Function) implementation
+    with adaptive features for nonlinear systems.
+    
     x: state vector
     z: measurement vector
     P: error covariance matrix
@@ -252,6 +254,7 @@ def ssif_ekf(x, z, P, Q, R, delta, motion_model, measurement_model, sensor_pos):
     motion_model: function for state transition
     measurement_model: function for measurement prediction
     sensor_pos: sensor position for measurement model
+    criterion: loss function for adaptive optimization
     """
     n = x.shape[0]
     m = z.shape[0]
@@ -269,21 +272,27 @@ def ssif_ekf(x, z, P, Q, R, delta, motion_model, measurement_model, sensor_pos):
 
     # Update stage
     z_pred = measurement_model(x_pred, sensor_pos)  # Predicted measurement
+    z_pred = z_pred.clone().detach().requires_grad_(True)  # Make prediction differentiable for loss
+    
     H = torch.zeros((m, n), device=x.device)  # Measurement Jacobian
     for j in range(n):
         x_perturbed = x_pred.clone()
         x_perturbed[j] += epsilon
-        H[:, j] = (measurement_model(x_perturbed, sensor_pos) - z_pred) / epsilon
+        H[:, j] = (measurement_model(x_perturbed, sensor_pos) - z_pred.detach()) / epsilon
+        
     innov = z - z_pred  # Innovation
     innov[1:3] = torch.atan2(torch.sin(innov[1:3]), torch.cos(innov[1:3]))  # Wrap angles to [-pi, pi]
+
+    # Compute loss for adaptive optimization
+    loss = criterion(z_pred, z)
 
     sat = sigmoid_saturation(innov, delta, alpha=0.7)  # Saturation terms
     S = H @ P_pred @ H.T + R  # Innovation covariance
     K = P_pred @ H.T @ torch.linalg.pinv(S)  # Kalman gain
-    x_updated = x_pred + K @ (sat * innov)  # Update state estimate
+    x_updated = x_pred + K @ (sat * innov.detach())  # Update state estimate
     P_updated = (torch.eye(n, device=x.device) - K @ H) @ P_pred  # Update error covariance
 
-    return x_updated, P_updated, z_pred
+    return x_updated, P_updated, z_pred, loss
 
 # Generate true satellite trajectory
 for k in range(1, len(t)):
@@ -358,41 +367,51 @@ for k in range(1, len(t)):
                 # Forward pass
                 nn_output = nn_model(z_input_tensor_normalized)
 
-                # Debugging: Attach gradient hooks to intermediate tensors
-                #def hook_fn(grad):
-                 #   print(f"Gradient at intermediate tensor: {grad}")
-                #nn_output.register_hook(hook_fn)
+                # Extract Q, R and delta parameters from NN output
+                q_values = nn_output[0, :n]  # First n elements for process noise diagonals
+                r_values = nn_output[0, n:n+m]  # Next m elements for measurement noise diagonals
+                delta_values = nn_output[0, n+m:]  # Last m elements for delta values
 
-                # Simplified loss for debugging
-                dummy_target = torch.zeros_like(nn_output)
-                loss = criterion(nn_output, dummy_target)
+                # Apply positive constraints
+                q_values = torch.exp(q_values)  # Ensure positive values for covariance
+                r_values = torch.exp(r_values)  # Ensure positive values for covariance
+                delta_values = torch.abs(delta_values)  # Ensure positive values for delta
+                
+                # Update the adaptive filter parameters
+                Q_opt = torch.diag(q_values)
+                R_opt = torch.diag(r_values)
+                delta_opt = delta_values
+                
+                # Run SSIF with adaptive features and get loss
+                x_updated, P_updated, z_pred, loss = ssif_adaptive(
+                    x_kf[:, k-1, node], z_node, P_kf[node], 
+                    Q_opt, R_opt, delta_opt, 
+                    satellite_motion_model, measurement_model, sensor_pos,
+                    criterion
+                )
+                
                 print(f"Node {node}, Epoch {epoch}, Loss: {loss.item()}")
 
                 # Backward pass
                 loss.backward()
-
-                # Debugging: Check gradients for each parameter
-                #for name, param in nn_model.named_parameters():
-                 #   if param.grad is not None:
-                  #      print(f"Gradient for {name}: {param.grad.norm().item()}")
-                   # else:
-                    #    print(f"Gradient for {name}: None (check for issues)")
 
                 # Gradient clipping to prevent exploding gradients
                 torch.nn.utils.clip_grad_norm_(nn_model.parameters(), max_norm=1.0)
 
                 optimizer.step()
 
-                # Update filter parameters
+                # Update filter parameters with the optimized values
                 with torch.no_grad():
-                    Q_opts[node] = Q.clone()
-                    R_opts[node] = R.clone()
-                    delta_opts[node] = torch.ones(m, dtype=torch.float32, device=device) * 0.01
+                    Q_opts[node] = Q_opt.detach().clone()
+                    R_opts[node] = R_opt.detach().clone()
+                    delta_opts[node] = delta_opt.detach().clone()
 
         # Regular filter update using current optimal parameters
-        x_kf[:, k, node], P_kf[node], _ = ssif_ekf(
-            x_kf[:, k-1, node], z_node, P_kf[node], Q_opts[node], R_opts[node], 
-            delta_opts[node], satellite_motion_model, measurement_model, sensor_pos
+        x_kf[:, k, node], P_kf[node], _, _ = ssif_adaptive(
+            x_kf[:, k-1, node], z_node, P_kf[node], 
+            Q_opts[node], R_opts[node], delta_opts[node],
+            satellite_motion_model, measurement_model, sensor_pos,
+            criterions[node]
         )
 
     # Consensus step for ADL-DKF using averaged model weights
