@@ -452,7 +452,7 @@ R_opts = [R_opt.clone() for _ in range(num_nodes)]
 # Generate true satellite trajectory
 for k in range(1, len(t)):
     # Check for fault condition - occurs halfway through simulation
-    fault_time_index = len(t) // 2
+    fault_time_index = len(t) // 1
     is_fault_active = k >= fault_time_index
     
     # True system dynamics with fault
@@ -485,7 +485,7 @@ for k in range(1, len(t)):
 # Simulation loop
 for k in range(1, len(t)):
     # Check for fault condition
-    fault_time_index = len(t) // 2
+    fault_time_index = len(t) // 1
     is_fault_active = k >= fault_time_index
     
     # ----- ADL-DKF -----
