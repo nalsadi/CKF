@@ -284,6 +284,16 @@ for k in range(1, len(t)):
 rmse_adldkf_total = np.sqrt(np.sum(np.mean(squared_error_kf, axis=2), axis=0))
 rmse_adldkf_state = np.sqrt(np.mean(squared_error_kf, axis=(0, 2)))
 
+# Print final RMSE per state
+state_names = ['x', 'vx', 'y', 'vy']
+print("\nFinal RMSE per state:")
+for i, state in enumerate(state_names):
+    print(f"{state}: {rmse_adldkf_state[i]:.6f}")
+
+# Print overall RMSE for the estimate
+overall_rmse = np.sqrt(np.mean(squared_error_kf))
+print(f"\nOverall RMSE for the estimate: {overall_rmse:.6f}")
+
 # Plot results
 plt.figure(figsize=(15, 12))
 plt.subplot(3, 2, 1)
