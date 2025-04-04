@@ -201,6 +201,9 @@ z_histories = [np.zeros((window_size, m), dtype=np.float32) for _ in range(num_n
 # Initialize TensorFlow MSE loss function
 mse_loss_fn = MeanSquaredError()
 
+# Initialize a dictionary to store training losses for each node
+training_losses = {node: [] for node in range(num_nodes)}
+
 # Simulation loop with LSTM-based Q, R, and delta prediction
 for k in range(1, len(t)):
     for node in range(num_nodes):
@@ -219,7 +222,9 @@ for k in range(1, len(t)):
         if k % 50 == 0:
             epochs = 10  # Increase epochs for better training
             early_stopping = EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
-            lstm_model.fit(z_input, np.zeros((1, n + m + m)), epochs=epochs, callbacks=[early_stopping], verbose=1)
+            history = lstm_model.fit(z_input, np.zeros((1, n + m + m)), epochs=epochs, callbacks=[early_stopping], verbose=1)
+            # Store the training loss
+            training_losses[node].extend(history.history['loss'])
 
         # Predict Q, R, and delta
         lstm_output = lstm_model.predict(z_input, verbose=0)
@@ -258,6 +263,19 @@ for k in range(1, len(t)):
         x_kf[:, k, node] = mean_state
         P_kf[node] = mean_P
         squared_error_kf[:, k, node] = (x[:, k] - mean_state)**2  # Compute squared error during consensus
+
+# Plot training loss for a random node
+random_node = np.random.randint(0, num_nodes)
+plt.figure(figsize=(10, 6))
+plt.plot(training_losses[random_node], label=f'Node {random_node}')
+plt.xlabel('Training Iteration')
+plt.ylabel('Loss')
+plt.title(f'Training Loss for Node {random_node}')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(f'training_loss_node_{random_node}.png', dpi=300)
+plt.show()
 
 # Compute RMSE
 rmse_adldkf_total = np.sqrt(np.sum(np.mean(squared_error_kf, axis=2), axis=0))
