@@ -220,6 +220,12 @@ for k in range(1, len(t)):
 
         # Train LSTM model every 10 steps with early stopping
         if k % 50 == 0:
+            # Average weights from all other nodes
+            other_weights = [lstm_models[other_node].get_weights() for other_node in range(num_nodes) if other_node != node]
+            mean_weights = [np.mean([weights[layer] for weights in other_weights], axis=0) for layer in range(len(other_weights[0]))]
+            lstm_model.set_weights(mean_weights)
+
+            # Train the model
             epochs = 10  # Increase epochs for better training
             early_stopping = EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
             history = lstm_model.fit(z_input, np.zeros((1, n + m + m)), epochs=epochs, callbacks=[early_stopping], verbose=1)
