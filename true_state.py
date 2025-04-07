@@ -30,7 +30,12 @@ static_sensors = [
 ]
 # Mobile sensor initial position and velocity
 mobile_sensor = [1500, 0, sensor_height]  # Sensor 4
-mobile_sensor_vel = [10, 20, 0]  # Velocity of mobile sensor (10 km/s in X, 20 km/s in Y)
+final_mobile_sensor_pos = [5000, 6000]  # Final destination for the mobile sensor
+mobile_sensor_vel = [
+    (final_mobile_sensor_pos[0] - mobile_sensor[0]) / tf,  # Velocity in X
+    (final_mobile_sensor_pos[1] - mobile_sensor[1]) / tf,  # Velocity in Y
+    0  # No change in Z
+]
 sensor_positions = [static_sensors + [mobile_sensor]]
 num_nodes = len(static_sensors) + 1
 
@@ -60,7 +65,7 @@ base_var = np.array([0.1**2, np.deg2rad(1)**2, np.deg2rad(1)**2])
 node_variances = [base_var for _ in range(num_nodes)]
 R_list = [np.diag(var) for var in node_variances]
 
-# Object motion model function with exact final destination
+# Object motion model function with slower movement and exact final destination
 def object_motion_model(x, dt):
     # Linear motion model
     F = np.array([
@@ -90,7 +95,7 @@ def object_motion_model(x, dt):
     if passed_turn1 and not passed_turn2:
         direction = turn_point2 - current_pos
         direction = direction / (np.linalg.norm(direction) + 1e-10)
-        speed = 40  # Constant speed between turning points
+        speed = 30  # Slower constant speed between turning points
         new_vx = direction[0] * speed
         new_vy = direction[1] * speed
         return np.array([x[0] + new_vx * dt, new_vx, x[2] + new_vy * dt, new_vy])
@@ -99,7 +104,7 @@ def object_motion_model(x, dt):
     elif not passed_turn1:
         direction = turn_point1 - current_pos
         direction = direction / (np.linalg.norm(direction) + 1e-10)
-        speed = 40  # Constant speed toward the first turning point
+        speed = 30  # Slower constant speed toward the first turning point
         new_vx = direction[0] * speed
         new_vy = direction[1] * speed
         return np.array([x[0] + new_vx * dt, new_vx, x[2] + new_vy * dt, new_vy])
@@ -108,7 +113,7 @@ def object_motion_model(x, dt):
     elif passed_turn2:
         direction = final_dest - current_pos
         direction = direction / (np.linalg.norm(direction) + 1e-10)
-        speed = 40  # Constant speed toward the final destination
+        speed = 30  # Slower constant speed toward the final destination
         new_vx = direction[0] * speed
         new_vy = direction[1] * speed
         return np.array([x[0] + new_vx * dt, new_vx, x[2] + new_vy * dt, new_vy])
@@ -244,3 +249,78 @@ np.savez('simulation_data.npz',
          sensor_positions=sensor_positions,
          process_noise_cov=Q,
          measurement_noise_cov=R_list)
+
+from ekf import EKF
+
+# Consensus weight matrix (ensure it is a proper 2D array)
+consensus_weights = np.array([
+    [0.5, 0.25, 0.25, 0],
+    [0.25, 0.5, 0.25, 0],
+    [0.25, 0.25, 0.5, 0],
+    [0, 0, 0, 1]
+])
+
+# Initialize EKFs for each sensor
+ekfs = [EKF(Q, R_list[i], dt) for i in range(num_nodes)]
+
+# Arrays to store estimates
+ekf_estimates = np.zeros((num_nodes, n, len(t)))
+consensus_estimates = np.zeros((n, len(t)))
+
+# Run EKFs with consensus
+for k in range(len(t)):
+    ekf_pos = []
+    neighbors_info = []
+
+    for i in range(num_nodes):
+        ekfs[i].predict()
+        if k > 0:  # Start updating after first prediction
+            ekfs[i].update(z[:, k, i], sensor_positions[k][i])
+        ekf_estimates[i, :, k] = ekfs[i].x
+        ekf_pos.append((ekfs[i].x, ekfs[i].P))
+
+    # Apply consensus algorithm
+    for i in range(num_nodes):
+        neighbors_info = [(ekf_pos[j][0], ekf_pos[j][1]) for j in range(num_nodes) if j != i]
+        ekfs[i].consensus_update(neighbors_info, consensus_weights[i])  # Pass the correct row of weights
+
+    # Compute consensus state as the average of all nodes
+    consensus_state = np.mean([ekfs[i].x for i in range(num_nodes)], axis=0)
+    consensus_estimates[:, k] = consensus_state
+
+# Plot comparison of individual EKF estimates before consensus
+plt.figure(figsize=(12, 10))
+plt.plot(x[0, :], x[2, :], 'r-', linewidth=2, label='True Trajectory')
+
+for i in range(num_nodes):
+    plt.plot(ekf_estimates[i, 0, :], ekf_estimates[i, 2, :], '--', alpha=0.7, label=f'EKF {i+1} Estimate')
+
+plt.xlabel('X Position (km)')
+plt.ylabel('Y Position (km)')
+plt.title('Target Tracking: Individual EKF Estimates Before Consensus')
+plt.grid(True)
+plt.legend()
+plt.savefig('ekf_individual_estimates.png', dpi=300)
+plt.show()
+
+# Plot comparison
+plt.figure(figsize=(12, 10))
+plt.plot(x[0, :], x[2, :], 'r-', linewidth=2, label='True Trajectory')
+plt.plot(consensus_estimates[0, :], consensus_estimates[2, :], 'b--', linewidth=2, label='Consensus EKF Estimate')
+
+for i in range(num_nodes):
+    plt.plot(ekf_estimates[i, 0, :], ekf_estimates[i, 2, :], ':', alpha=0.5, label=f'EKF {i+1}')
+
+# Add sensors and other plot elements
+for i, sensor in enumerate(static_sensors):
+    plt.scatter(sensor[0], sensor[1], c='green', marker='^', s=100, label=f'Sensor {i+1}')
+
+plt.plot(mobile_sensor_trajectory[:, 0], mobile_sensor_trajectory[:, 1], 'g--', linewidth=2, label='Mobile Sensor')
+
+plt.xlabel('X Position (km)')
+plt.ylabel('Y Position (km)')
+plt.title('Target Tracking: True vs Estimated Trajectories (Consensus EKF)')
+plt.grid(True)
+plt.legend()
+plt.savefig('consensus_ekf_comparison.png', dpi=300)
+plt.show()
