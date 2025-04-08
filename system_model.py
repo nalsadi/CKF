@@ -10,17 +10,20 @@ tf = 500
 T = 5
 t = np.arange(0, tf + T, T)
 n = 4  # Number of states
-m = 2  # Number of measurements
+m = 3  # Number of measurements: [r, psi, theta]
 
 # Initial state
 x_true = np.array([[25e3], [-120], [10e3], [0]])
 x_kf = x_true.copy()
 
-# Measurement matrix
-H = np.array([
-    [1, 0, 0, 0],
-    [0, 0, 1, 0]
-])
+
+# Place sensors along the y = 0 axis
+sensor_positions = [
+    [-0.5e4, 0, 0],  # Moving sensor initial position
+    [0, 0, 0],       # First stationary sensor
+    [0.5e4, 0, 0],   # Second stationary sensor
+    [1.0e4, 0, 0],   # Third stationary sensor
+]
 
 # Uniform motion model
 UM = np.array([
@@ -50,7 +53,7 @@ Q1 = L1 * np.array([
     [0, 0, T**3 / 3, T**2 / 2],
     [0, 0, T**2 / 2, T]
 ])
-R = (500)**2 * np.eye(m)
+R = np.diag([500**2, np.deg2rad(1)**2, np.deg2rad(1)**2])  # Noise for [r, psi, theta]
 
 # Initial covariance matrix
 P_kf = np.diag([R[0, 0], 100, R[1, 1], 100])
@@ -58,13 +61,12 @@ P_kf = np.diag([R[0, 0], 100, R[1, 1], 100])
 # System and measurement noise
 num_steps = len(t) - 1
 w = np.random.multivariate_normal(np.zeros(n), Q1, num_steps).T
-v = np.random.multivariate_normal(np.zeros(m), R, num_steps).T
+v = np.random.multivariate_normal(np.zeros(m), R, (len(sensor_positions), num_steps)).transpose(1, 2, 0)
 
 # Storage
 x_store = np.zeros((n, len(t)))
-z_store = np.zeros((m, len(t)))
+z_store = np.zeros((len(sensor_positions), m, len(t)))  # Shape: (num_sensors, measurements per sensor, time steps)
 x_store[:, 0] = x_true[:, 0]
-z_store[:, 0] = (H @ x_true).flatten()
 
 # Object motion model function
 def object_motion_model(x, dt):
@@ -79,13 +81,6 @@ def object_motion_model(x, dt):
     else:
         return UM @ x
 
-# Place sensors along the y = 0 axis
-sensor_positions = [
-    [-0.5e4, 0],  # Moving sensor initial position
-    [0, 0],       # First stationary sensor
-    [0.5e4, 0],   # Second stationary sensor
-    [1.0e4, 0],   # Third stationary sensor
-]
 
 # Moving sensor trajectory
 moving_sensor_start = np.array([-0.5e4, 0])  # Starting position
@@ -93,7 +88,7 @@ moving_sensor_end = np.array([1e4, 5e3])     # Ending position
 moving_sensor_velocity = (moving_sensor_end - moving_sensor_start) / tf  # Velocity
 
 moving_sensor_positions = np.array([
-    moving_sensor_start + moving_sensor_velocity * t_step
+    np.append(moving_sensor_start + moving_sensor_velocity * t_step, 0)  # Append z = 0
     for t_step in t
 ])
 
@@ -103,13 +98,35 @@ sensor_positions_dynamic = [
     for k in range(len(t))
 ]
 
+# Define target height (assumed constant for simplicity)
+target_height = 1000  # in meters
+
+# Updated measurement model function
+def measurement_model(x, sensor_pos):
+    dx = x[0] - sensor_pos[0]  # ξk - x^i_k
+    dy = x[2] - sensor_pos[1]  # ηk - y^i_k
+    h = target_height - sensor_pos[2]  # Height difference
+    
+    # Distance calculation: sqrt((ξk - x^i_k)^2 + (ηk - y^i_k)^2 + h^2)
+    d_squared = dx**2 + dy**2
+    r = np.sqrt(d_squared + h**2)
+    
+    # Azimuth angle: arctan((ηk - y^i_k)/(ξk - x^i_k))
+    psi = np.arctan2(dy, dx)
+    
+    # Pitch angle: arctan(h/sqrt((ξk - x^i_k)^2 + (ηk - y^i_k)^2))
+    theta = np.arctan2(h, np.sqrt(d_squared))
+    
+    return np.array([r, psi, theta])
+
 # --- Simulate True Trajectory and Measurements ---
 for k in range(num_steps):
     # State propagation with process noise
     x_store[:, k + 1] = object_motion_model(x_store[:, k], T).flatten() + w[:, k]
     
-    # Generate measurements for each sensor
-    z_store[:, k + 1] = (H @ x_store[:, k + 1]).flatten() + v[:, k]
+    # Generate measurements for each sensor and store them individually
+    for i, sensor_pos in enumerate(sensor_positions_dynamic[k]):
+        z_store[i, :, k + 1] = measurement_model(x_store[:, k + 1], sensor_pos) + v[k, :, i]
 
 # --- PLOTS ---
 
@@ -166,12 +183,13 @@ plt.savefig('target_tracking_3d.png', dpi=300)
 plt.show()
 
 # 3. Azimuth Angles Visualization
-azimuth_angles = np.arctan2(x_store[2, :] - np.array(sensor_positions)[:, 1][:, None], 
-                            x_store[0, :] - np.array(sensor_positions)[:, 0][:, None])
-
 plt.figure(figsize=(10, 6))
+
+# Extract azimuth angles (second measurement component) from z_store
 for i in range(len(sensor_positions)):
-    plt.plot(t, np.rad2deg(azimuth_angles[i, :]), label=f'Sensor {i+1}')
+    azimuth_angles = z_store[i, 1, :]  # Second component (psi) for each sensor
+    plt.plot(t, np.rad2deg(azimuth_angles), label=f'Sensor {i+1}')
+
 plt.xlabel('Time (s)')
 plt.ylabel('Azimuth Angle (degrees)')
 plt.title('Azimuth Angles Measured by Sensors')
