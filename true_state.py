@@ -588,3 +588,109 @@ with open(mean_rmse_ukf_file, mode='w', newline='') as file:
     writer.writerow(['Time (s)', 'Mean RMSE'])
     for k in range(len(t)):
         writer.writerow([t[k], mean_rmse_ukf_per_timestep[k]])
+
+# Monte Carlo simulation parameters
+M = 100  # Number of Monte Carlo runs
+
+# Initialize arrays to store RMSE for each Monte Carlo run
+rmse_ekf_mc = np.zeros((M, len(t)))
+rmse_ukf_mc = np.zeros((M, len(t)))
+
+# Monte Carlo simulation
+for monte_carlo_run in range(M):
+    # Generate new process noise and measurement noise for this run
+    w_mc = np.random.multivariate_normal(mean=np.zeros(n), cov=Q, size=len(t)).T
+    z_mc = np.zeros((m, len(t), num_nodes))
+    x_mc = np.zeros((n, len(t)))
+    x_mc[:, 0] = x0_true
+
+    for k in range(1, len(t)):
+        # State propagation with process noise
+        x_mc[:, k] = object_motion_model(x_mc[:, k-1], dt) + w_mc[:, k]
+
+        # Generate measurements for each sensor
+        for node in range(num_nodes):
+            sensor_pos = sensor_positions[k][node]
+            true_measurement = measurement_model(x_mc[:, k], sensor_pos)
+            v_mc = np.random.multivariate_normal(mean=np.zeros(m), cov=R_list[node])
+            z_mc[:, k, node] = true_measurement + v_mc
+
+    # Run EKF and UKF for this Monte Carlo run
+    ekfs_mc = [EKF(Q, R_list[i], dt) for i in range(num_nodes)]
+    ukfs_mc = [CustomUKF(n, m, dt, Q, R_list[i], initial_state) for i in range(num_nodes)]
+    consensus_estimates_mc = np.zeros((n, len(t)))
+    ukf_consensus_estimates_mc = np.zeros((n, len(t)))
+
+    for k in range(len(t)):
+        ekf_pos_mc = []
+        ukf_pos_mc = []
+
+        for i in range(num_nodes):
+            # EKF
+            ekfs_mc[i].predict()
+            if k > 0:
+                ekfs_mc[i].update(z_mc[:, k, i], sensor_positions[k][i])
+            ekf_pos_mc.append((ekfs_mc[i].x, ekfs_mc[i].P))
+
+            # UKF
+            ukfs_mc[i].update_sensor_position(sensor_positions[k][i])
+            ukfs_mc[i].predict()
+            if k > 0:
+                ukfs_mc[i].update(z_mc[:, k, i])
+            ukf_pos_mc.append((ukfs_mc[i].x, ukfs_mc[i].P))
+
+        # Apply consensus for EKF
+        for i in range(num_nodes):
+            neighbors_info = [(ekf_pos_mc[j][0], ekf_pos_mc[j][1]) for j in range(num_nodes) if j != i]
+            ekfs_mc[i].consensus_update(neighbors_info, consensus_weights[i])
+        consensus_state_mc = np.mean([ekfs_mc[i].x for i in range(num_nodes)], axis=0)
+        consensus_estimates_mc[:, k] = consensus_state_mc
+
+        # Apply consensus for UKF
+        for i in range(num_nodes):
+            neighbors_info = [(ukf_pos_mc[j][0], ukf_pos_mc[j][1]) for j in range(num_nodes) if j != i]
+            ukfs_mc[i].consensus_update(neighbors_info, consensus_weights[i])
+        ukf_consensus_state_mc = np.mean([ukfs_mc[i].x for i in range(num_nodes)], axis=0)
+        ukf_consensus_estimates_mc[:, k] = ukf_consensus_state_mc
+
+    # Calculate RMSE for this Monte Carlo run
+    for k in range(len(t)):
+        rmse_ekf_mc[monte_carlo_run, k] = np.sqrt(
+            (x_mc[0, k] - consensus_estimates_mc[0, k])**2 +
+            (x_mc[2, k] - consensus_estimates_mc[2, k])**2
+        )
+        rmse_ukf_mc[monte_carlo_run, k] = np.sqrt(
+            (x_mc[0, k] - ukf_consensus_estimates_mc[0, k])**2 +
+            (x_mc[2, k] - ukf_consensus_estimates_mc[2, k])**2
+        )
+
+# Calculate average RMSE over all Monte Carlo runs
+avg_rmse_ekf_mc = np.mean(rmse_ekf_mc, axis=0)
+avg_rmse_ukf_mc = np.mean(rmse_ukf_mc, axis=0)
+
+# Save average RMSE over time for Monte Carlo simulation
+avg_rmse_ekf_mc_file = 'avg_rmse_ekf_mc.csv'
+with open(avg_rmse_ekf_mc_file, mode='w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow(['Time (s)', 'Average RMSE'])
+    for k in range(len(t)):
+        writer.writerow([t[k], avg_rmse_ekf_mc[k]])
+
+avg_rmse_ukf_mc_file = 'avg_rmse_ukf_mc.csv'
+with open(avg_rmse_ukf_mc_file, mode='w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow(['Time (s)', 'Average RMSE'])
+    for k in range(len(t)):
+        writer.writerow([t[k], avg_rmse_ukf_mc[k]])
+
+# Plot RMSE comparison for Monte Carlo simulation
+plt.figure(figsize=(12, 8))
+plt.plot(t, avg_rmse_ekf_mc, label='EKF Average RMSE', linewidth=2)
+plt.plot(t, avg_rmse_ukf_mc, label='UKF Average RMSE', linewidth=2)
+plt.xlabel('Time (s)')
+plt.ylabel('Average RMSE')
+plt.title('RMSE Comparison: EKF vs UKF (Monte Carlo Simulation)')
+plt.legend()
+plt.grid(True)
+plt.savefig('rmse_comparison_mc.png', dpi=300)
+plt.show()
