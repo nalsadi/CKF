@@ -98,7 +98,6 @@ for k in range(num_steps):
         
     z_store[:, k+1] = (H @ x_store[:, k+1]).flatten() + v[:, k]
 
-# Dummy KF, EKF, UKF update functions
 def kf_predict(x, P, F, Q):
     x_pred = F @ x
     P_pred = F @ P @ F.T + Q
@@ -137,6 +136,10 @@ print("\nSimulation Results:")
 print("State\tKF RMSE")
 for i in range(n):
     print(f"{i+1}\t{rmse_kf[i]:.2f}")
+
+# Calculate and display mean RMSE
+mean_rmse_kf = np.mean(rmse_kf)
+print(f"\nMean RMSE (KF): {mean_rmse_kf:.2f}")
 
 # --- PLOTS ---
 
