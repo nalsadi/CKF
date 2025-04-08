@@ -1,6 +1,9 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+import csv  # Add import for CSV file handling
+from filterpy.kalman import UnscentedKalmanFilter as UKF
+from filterpy.kalman import MerweScaledSigmaPoints
 
 # Set seeds for reproducibility
 seed = 42
@@ -324,3 +327,185 @@ plt.grid(True)
 plt.legend()
 plt.savefig('consensus_ekf_comparison.png', dpi=300)
 plt.show()
+
+# Save azimuth angles to a CSV file
+azimuth_file = 'azimuth_angles.csv'
+with open(azimuth_file, mode='w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow(['Time (s)'] + [f'Sensor {i+1}' for i in range(num_nodes)])
+    for k in range(len(t)):
+        writer.writerow([t[k]] + list(np.rad2deg(z[1, k, :])))
+
+# Save EKF estimates to individual CSV files
+for i in range(num_nodes):
+    ekf_file = f'ekf_estimates_sensor_{i+1}.csv'
+    with open(ekf_file, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['Time (s)', 'X Position (km)', 'X Velocity (km/s)', 'Y Position (km)', 'Y Velocity (km/s)'])
+        for k in range(len(t)):
+            writer.writerow([t[k]] + list(ekf_estimates[i, :, k]))
+
+# Save consensus EKF estimates to a CSV file
+consensus_file = 'consensus_ekf_estimates.csv'
+with open(consensus_file, mode='w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow(['Time (s)', 'X Position (km)', 'X Velocity (km/s)', 'Y Position (km)', 'Y Velocity (km/s)'])
+    for k in range(len(t)):
+        writer.writerow([t[k]] + list(consensus_estimates[:, k]))
+
+# Create a custom UKF class to handle changing measurement functions
+class CustomUKF:
+    def __init__(self, dim_x, dim_z, dt, Q, R, initial_x=None):
+        # Create sigma points
+        points = MerweScaledSigmaPoints(n=dim_x, alpha=0.1, beta=2.0, kappa=0)
+        
+        # Initialize the filter
+        self.ukf = UKF(dim_x=dim_x, dim_z=dim_z, dt=dt, fx=self.fx, hx=self.hx, points=points)
+        self.ukf.Q = Q
+        self.ukf.R = R
+        
+        # Set initial state and covariance
+        if initial_x is None:
+            self.ukf.x = np.array([x0_true[0], 0, x0_true[2], 0])  # Use true initial state with zero velocity
+        else:
+            self.ukf.x = initial_x
+        self.ukf.P = np.eye(dim_x) * 10.0  # Higher initial uncertainty
+        
+        # Store sensor position
+        self.sensor_pos = np.zeros(3)
+        
+    def fx(self, x, dt):
+        return object_motion_model(x, dt)
+    
+    def hx(self, x):
+        return measurement_model(x, self.sensor_pos)
+    
+    def update_sensor_position(self, pos):
+        self.sensor_pos = np.array(pos)
+    
+    def predict(self):
+        self.ukf.predict()
+    
+    def update(self, z):
+        self.ukf.update(z)
+    
+    @property
+    def x(self):
+        return self.ukf.x
+    
+    @property
+    def P(self):
+        return self.ukf.P
+    
+    # Add consensus update method similar to EKF
+    def consensus_update(self, neighbors_info, weights):
+        # Extract own state and covariance
+        x_i = self.ukf.x
+        P_i = self.ukf.P
+        
+        # Initialize weighted sum
+        x_weighted_sum = weights[0] * x_i
+        P_inv_weighted_sum = weights[0] * np.linalg.inv(P_i)
+        
+        # Iterate through neighbors
+        for j, (x_j, P_j) in enumerate(neighbors_info):
+            x_weighted_sum += weights[j+1] * x_j
+            P_inv_weighted_sum += weights[j+1] * np.linalg.inv(P_j)
+        
+        # Update state and covariance
+        self.ukf.P = np.linalg.inv(P_inv_weighted_sum)
+        self.ukf.x = self.ukf.P @ (P_inv_weighted_sum @ x_weighted_sum)
+
+# Initialize UKFs for each sensor with proper initial state
+initial_state = np.array([x0_true[0], 0, x0_true[2], 0])  # Start with position and zero velocities
+ukfs = [CustomUKF(n, m, dt, Q, R_list[i], initial_state) for i in range(num_nodes)]
+
+# Arrays to store UKF estimates
+ukf_estimates = np.zeros((num_nodes, n, len(t)))
+ukf_consensus_estimates = np.zeros((n, len(t)))
+
+# Run UKFs with consensus
+for k in range(len(t)):
+    ukf_pos = []
+
+    for i in range(num_nodes):
+        # Update the sensor position
+        ukfs[i].update_sensor_position(sensor_positions[k][i])
+        
+        # Predict step
+        ukfs[i].predict()
+        
+        # Update step - only update after first time step to allow prediction to run first
+        if k > 0:  
+            ukfs[i].update(z[:, k, i])
+            
+        # Store estimates
+        ukf_estimates[i, :, k] = ukfs[i].x
+        ukf_pos.append((ukfs[i].x, ukfs[i].P))
+
+    # Apply consensus algorithm
+    for i in range(num_nodes):
+        # Extract weights for this node
+        node_weights = consensus_weights[i]
+        # Get neighbors info (excluding self)
+        neighbors_info = [(ukf_pos[j][0], ukf_pos[j][1]) for j in range(num_nodes) if j != i]
+        # Apply consensus
+        ukfs[i].consensus_update(neighbors_info, node_weights)
+
+    # Compute consensus state as the average of all nodes
+    consensus_state = np.mean([ukfs[i].x for i in range(num_nodes)], axis=0)
+    ukf_consensus_estimates[:, k] = consensus_state
+
+# Plot comparison of individual UKF estimates before consensus
+plt.figure(figsize=(12, 10))
+plt.plot(x[0, :], x[2, :], 'r-', linewidth=2, label='True Trajectory')
+
+for i in range(num_nodes):
+    plt.plot(ukf_estimates[i, 0, :], ukf_estimates[i, 2, :], '--', alpha=0.7, label=f'UKF {i+1} Estimate')
+
+plt.xlabel('X Position (km)')
+plt.ylabel('Y Position (km)')
+plt.title('Target Tracking: Individual UKF Estimates Before Consensus')
+plt.grid(True)
+plt.legend()
+plt.savefig('ukf_individual_estimates.png', dpi=300)
+plt.show()
+
+# Plot comparison of UKF consensus estimates
+plt.figure(figsize=(12, 10))
+plt.plot(x[0, :], x[2, :], 'r-', linewidth=2, label='True Trajectory')
+plt.plot(ukf_consensus_estimates[0, :], ukf_consensus_estimates[2, :], 'b--', linewidth=2, label='Consensus UKF Estimate')
+
+for i in range(num_nodes):
+    plt.plot(ukf_estimates[i, 0, :], ukf_estimates[i, 2, :], ':', alpha=0.5, label=f'UKF {i+1}')
+
+# Add sensors and other plot elements
+for i, sensor in enumerate(static_sensors):
+    plt.scatter(sensor[0], sensor[1], c='green', marker='^', s=100, label=f'Sensor {i+1}')
+
+plt.plot(mobile_sensor_trajectory[:, 0], mobile_sensor_trajectory[:, 1], 'g--', linewidth=2, label='Mobile Sensor')
+
+plt.xlabel('X Position (km)')
+plt.ylabel('Y Position (km)')
+plt.title('Target Tracking: True vs Estimated Trajectories (Consensus UKF)')
+plt.grid(True)
+plt.legend()
+plt.savefig('consensus_ukf_comparison.png', dpi=300)
+plt.show()
+
+# Save UKF estimates to individual CSV files
+for i in range(num_nodes):
+    ukf_file = f'ukf_estimates_sensor_{i+1}.csv'
+    with open(ukf_file, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['Time (s)', 'X Position (km)', 'X Velocity (km/s)', 'Y Position (km)', 'Y Velocity (km/s)'])
+        for k in range(len(t)):
+            writer.writerow([t[k]] + list(ukf_estimates[i, :, k]))
+
+# Save consensus UKF estimates to a CSV file
+ukf_consensus_file = 'consensus_ukf_estimates.csv'
+with open(ukf_consensus_file, mode='w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow(['Time (s)', 'X Position (km)', 'X Velocity (km/s)', 'Y Position (km)', 'Y Velocity (km/s)'])
+    for k in range(len(t)):
+        writer.writerow([t[k]] + list(ukf_consensus_estimates[:, k]))
