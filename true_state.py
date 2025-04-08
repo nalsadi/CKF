@@ -509,3 +509,82 @@ with open(ukf_consensus_file, mode='w', newline='') as file:
     writer.writerow(['Time (s)', 'X Position (km)', 'X Velocity (km/s)', 'Y Position (km)', 'Y Velocity (km/s)'])
     for k in range(len(t)):
         writer.writerow([t[k]] + list(ukf_consensus_estimates[:, k]))
+
+# Calculate RMSE for EKF and UKF
+def calculate_rmse(true_states, estimates):
+    errors = true_states - estimates
+    mse = np.mean(errors**2, axis=1)
+    rmse = np.sqrt(mse)
+    return rmse
+
+# Compute RMSE for EKF and UKF consensus estimates
+rmse_ekf = calculate_rmse(x, consensus_estimates)
+rmse_ukf = calculate_rmse(x, ukf_consensus_estimates)
+
+# Print RMSE results
+print("RMSE for EKF Consensus:")
+print(f"X Position: {rmse_ekf[0]:.4f}, X Velocity: {rmse_ekf[1]:.4f}, Y Position: {rmse_ekf[2]:.4f}, Y Velocity: {rmse_ekf[3]:.4f}")
+
+print("RMSE for UKF Consensus:")
+print(f"X Position: {rmse_ukf[0]:.4f}, X Velocity: {rmse_ukf[1]:.4f}, Y Position: {rmse_ukf[2]:.4f}, Y Velocity: {rmse_ukf[3]:.4f}")
+
+# Compute mean RMSE across all state dimensions
+mean_rmse_ekf = np.mean(rmse_ekf)
+mean_rmse_ukf = np.mean(rmse_ukf)
+
+# Print final mean RMSE
+print(f"Final Mean RMSE for EKF Consensus: {mean_rmse_ekf:.4f}")
+print(f"Final Mean RMSE for UKF Consensus: {mean_rmse_ukf:.4f}")
+
+# Plot RMSE comparison
+plt.figure(figsize=(10, 6))
+plt.bar(['X Position', 'X Velocity', 'Y Position', 'Y Velocity'], rmse_ekf, alpha=0.6, label='EKF RMSE')
+plt.bar(['X Position', 'X Velocity', 'Y Position', 'Y Velocity'], rmse_ukf, alpha=0.6, label='UKF RMSE')
+plt.ylabel('RMSE')
+plt.title('RMSE Comparison: EKF vs UKF')
+plt.legend()
+plt.grid(True)
+plt.savefig('rmse_comparison.png', dpi=300)
+plt.show()
+
+# Calculate RMSE over time for EKF and UKF
+rmse_ekf_over_time = np.sqrt((x - consensus_estimates)**2)
+rmse_ukf_over_time = np.sqrt((x - ukf_consensus_estimates)**2)
+
+# Save RMSE over time for each state to individual CSV files
+states = ['X Position', 'X Velocity', 'Y Position', 'Y Velocity']
+for i, state in enumerate(states):
+    # EKF RMSE
+    ekf_rmse_file = f'ekf_rmse_{state.lower().replace(" ", "_")}.csv'
+    with open(ekf_rmse_file, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['Time (s)', 'RMSE'])
+        for k in range(len(t)):
+            writer.writerow([t[k], rmse_ekf_over_time[i, k]])
+    
+    # UKF RMSE
+    ukf_rmse_file = f'ukf_rmse_{state.lower().replace(" ", "_")}.csv'
+    with open(ukf_rmse_file, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['Time (s)', 'RMSE'])
+        for k in range(len(t)):
+            writer.writerow([t[k], rmse_ukf_over_time[i, k]])
+
+# Calculate mean RMSE per time step for EKF and UKF
+mean_rmse_ekf_per_timestep = np.mean(rmse_ekf_over_time, axis=0)
+mean_rmse_ukf_per_timestep = np.mean(rmse_ukf_over_time, axis=0)
+
+# Save mean RMSE per time step to CSV files
+mean_rmse_ekf_file = 'mean_rmse_ekf_per_timestep.csv'
+with open(mean_rmse_ekf_file, mode='w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow(['Time (s)', 'Mean RMSE'])
+    for k in range(len(t)):
+        writer.writerow([t[k], mean_rmse_ekf_per_timestep[k]])
+
+mean_rmse_ukf_file = 'mean_rmse_ukf_per_timestep.csv'
+with open(mean_rmse_ukf_file, mode='w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow(['Time (s)', 'Mean RMSE'])
+    for k in range(len(t)):
+        writer.writerow([t[k], mean_rmse_ukf_per_timestep[k]])
