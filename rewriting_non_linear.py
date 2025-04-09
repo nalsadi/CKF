@@ -93,7 +93,6 @@ def ekf(k,x, z, P, Q, R, motion_model, measurement_model, sensor_pos, delta, alp
     innov = z - z_pred
     innov[1:3] = np.arctan2(np.sin(innov[1:3]), np.cos(innov[1:3]))
     sat = sigmoid_saturation(torch.tensor(innov), torch.tensor(delta), alpha=alpha).numpy()
-    print(delta)
     S = H @ P_pred @ H.T + R
     K = P_pred @ H.T @ np.linalg.pinv(S)
     x_updated = x_pred + K @ (sat * innov)
@@ -110,8 +109,6 @@ Q = L1 * np.array([
 ])
 R = np.diag([500**2, np.deg2rad(1)**2, np.deg2rad(1)**2])  # Noise for [r, psi, theta]
 
-R = np.diag([500**2, np.deg2rad(1)**2, np.deg2rad(1)**2])  # Noise for [r, psi, theta]
-
 w = np.random.multivariate_normal(mean=np.zeros(n), cov=Q, size=len(t)).T
 v = np.random.multivariate_normal(mean=np.zeros(m), cov=R, size=len(t)).T
 
@@ -123,7 +120,7 @@ u = np.zeros(len(t))
 x_kf = np.zeros((n, len(t)))
 x_true = np.array([[25e3], [-120], [10e3], [0]])
 x[:, 0] = x_true.flatten()
-
+x_kf[:, 0] = x_true.flatten()
 P_kf = np.zeros((n, n, len(t)))
 P_kf[:, :, 0] = 10 * Q
 squared_error_assf = np.zeros((n, len(t)))
@@ -161,7 +158,7 @@ def measurement_model(x, sensor_pos):
     
     return np.array([r, psi, theta])
 
-# --- Simulat
+# --- Simulate True Trajectory and Measurements ---
 for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
     x[:, k+1] = object_motion_model(x[:, k], dt, k+1) + w[:, k]
     
@@ -170,8 +167,8 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
     
     
     # Every 100 steps, use LSTM to estimate Q and R
-    if k % 100 == 0:
-        for epoch in range(2):
+    if k % 10 == 0:
+        for epoch in range(100):
             z_input = z[:, :k+1].T
             z_input_normalized = (z_input - np.mean(z_input, axis=0)) / (np.std(z_input, axis=0) + 1e-8)
             lstm_input = z_input_normalized.T
@@ -191,9 +188,7 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
             R_new = np.diag(r_diag)
             delta_opt = delta_out
 
-            print(f"Q_new: {Q_new.shape}")
-            print(f"R_new: {R_new.shape}")
-            print(f"delta_opt: {delta_opt.shape}")
+            
             # Perform EKF prediction and update
             # ASSF
             x_kf_new, P_kf_new, z_pred_new = ekf(k,x_kf[:, k-1], z[:, k+1], P_kf[:, :, k-1], Q_new, R_new,object_motion_model,measurement_model,[0,0,0], delta_opt)
@@ -203,6 +198,7 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
         
             # Compute loss
             loss = np.mean((z_pred_new - z[:, k+1])**2)
+            print(f"Time step {k}: Loss = {loss}")
             
             # Compute gradients with correct shapes
             output_grad = 2 * (z_pred_new - z[:, k+1])  # Shape: (3,)
@@ -230,7 +226,7 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
         Q_opt = Q_new
         R_opt = R_new
         delta_opt = delta_out
-
+        exit()
     # Replace the ssif line with ekf
     x_kf[:, k], P_kf[:, :, k], _ = ekf(k, x_kf[:, k-1], z[:, k+1], P_kf[:, :, k-1], Q_opt, R_opt, 
                                       object_motion_model, measurement_model, [0,0,0], delta_opt)
