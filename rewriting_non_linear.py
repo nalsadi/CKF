@@ -110,6 +110,8 @@ Q = L1 * np.array([
 ])
 R = np.diag([500**2, np.deg2rad(1)**2, np.deg2rad(1)**2])  # Noise for [r, psi, theta]
 
+R = np.diag([500**2, np.deg2rad(1)**2, np.deg2rad(1)**2])  # Noise for [r, psi, theta]
+
 w = np.random.multivariate_normal(mean=np.zeros(n), cov=Q, size=len(t)).T
 v = np.random.multivariate_normal(mean=np.zeros(m), cov=R, size=len(t)).T
 
@@ -133,7 +135,7 @@ R_opt = np.diag([0, 0, 0]).astype(np.float32)
 # Initialize LSTM
 input_size = m  # Number of measurements as input
 hidden_size = 32  # Hidden state size of LSTM
-output_size = n + m + n  # Output is diagonal of Q, R, and delta
+output_size = n + m + m  # Output is diagonal of Q, R, and delta
 lstm_model = QREstimatorLSTM(input_size, hidden_size, output_size)
 
 
@@ -177,9 +179,9 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
             # Forward pass
             lstm_output = lstm_model.forward(lstm_input)
 
-            q_diag = lstm_output[:n]
-            r_diag = lstm_output[n:2*n]
-            delta_out = lstm_output[2*n:]
+            q_diag = lstm_output[:n]  # First 4 elements for Q (state dimension)
+            r_diag = lstm_output[n:n+m]  # Next 3 elements for R (measurement dimension)
+            delta_out = lstm_output[n+m:]  # Last 3 elements for delta
 
             q_diag = np.log(1 + np.exp(q_diag))
             r_diag = np.log(1 + np.exp(r_diag))
@@ -189,6 +191,10 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
             R_new = np.diag(r_diag)
             delta_opt = delta_out
 
+            print(f"Q_new: {Q_new.shape}")
+            print(f"R_new: {R_new.shape}")
+            print(f"delta_opt: {delta_opt.shape}")
+            # Perform EKF prediction and update
             # ASSF
             x_kf_new, P_kf_new, z_pred_new = ekf(k,x_kf[:, k-1], z[:, k+1], P_kf[:, :, k-1], Q_new, R_new,object_motion_model,measurement_model,[0,0,0], delta_opt)
             
@@ -196,16 +202,16 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
           #  x_kf[:, k-1], z_node, P_kf[node], Q_pred, R_pred,object_motion_model, measurement_model, sensor_pos, delta
         
             # Compute loss
-            '''loss = np.mean((z_pred_new - z[:, k+1])**2)
+            loss = np.mean((z_pred_new - z[:, k+1])**2)
             
             # Compute gradients with correct shapes
             output_grad = 2 * (z_pred_new - z[:, k+1])  # Shape: (3,)
-            
-            # Expand output gradient to match output size
-            full_grad = np.zeros(output_size)  # Shape: (9,)
-            full_grad[:m] = output_grad  # First m elements for Q
-            full_grad[m:2*m] = output_grad  # Next m elements for R
-            full_grad[2*m:] = output_grad  # Last m elements for delta
+
+            # Expand output gradient to match output size (n + m + m = 10)
+            full_grad = np.zeros(output_size)  # Shape: (10,)
+            full_grad[:n] = np.tile(output_grad.mean(), n)  # First n elements for Q
+            full_grad[n:n+m] = output_grad  # Next m elements for R
+            full_grad[n+m:] = output_grad  # Last m elements for delta
             
             # Backpropagate through fully connected layer
             h_last = np.tanh(np.dot(lstm_model.weights_ih, lstm_input[:, -1]) + 
@@ -225,28 +231,23 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
         R_opt = R_new
         delta_opt = delta_out
 
-    x_kf[:, k], P_kf[:, :, k], _ = ssif(x_kf[:, k-1], z[:, k+1], u[k], P_kf[:, :, k-1], A, B, C, Q_opt, R_opt, delta_opt)
+    # Replace the ssif line with ekf
+    x_kf[:, k], P_kf[:, :, k], _ = ekf(k, x_kf[:, k-1], z[:, k+1], P_kf[:, :, k-1], Q_opt, R_opt, 
+                                      object_motion_model, measurement_model, [0,0,0], delta_opt)
     squared_error_assf[:, k+1] = (x[:, k+1] - x_kf[:, k])**2
-'''
+
 plt.figure(figsize=(10, 6))
 plt.plot(x[0, :], x[2, :], 'r-', linewidth=2, label='True Trajectory')
-plt.xlabel('X Position')
-plt.ylabel('Y Position')
-plt.title('True Trajectory')
-plt.legend()
-plt.grid(True)
-plt.show()
-print(x[0, :])
-exit()
-plt.plot(t[:-1], x_kf[0, :-1], label='Kalman Filter Position')
+plt.plot(x_kf[0, :], x_kf[2, :], 'b--', label='Kalman Filter Position')  # Fixed indexing
 plt.xlabel('Time (sec)')
 plt.ylabel('Position')
 plt.legend()
 plt.grid(True)
 plt.show()
 
+# Calculate RMSE for position and velocity only (since we have 4 state dimensions)
 rmse_assf = np.sqrt(np.mean(squared_error_assf[:, :-1], axis=1))
-states = ['Position', 'Velocity', 'Acceleration']
+states = ['X Position', 'X Velocity', 'Y Position', 'Y Velocity']  # Match state dimensions
 results_rmse = pd.DataFrame({
     'State': states,
     'ASSF RMSE': rmse_assf,
