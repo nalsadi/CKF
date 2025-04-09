@@ -7,100 +7,149 @@ seed = 42
 np.random.seed(seed)
 
 # Simulation parameters
-tf = 200
-dt = 0.7
+tf = 400  # Total simulation time (seconds)
+dt = 0.5  # Time interval (seconds)
 t = np.arange(0, tf + dt, dt)
-n = 4
-m = 3
+n = 4  # State dimension
+m = 3  # Measurement dimension
 
-# Orbital parameters
-center_x = 35
-center_y = 30
-orbital_radius = 15
-orbital_period = 120
-angular_velocity = 2 * np.pi / orbital_period
-target_height = 0.5
-sensor_height = 0.2
+# Object parameters
+target_height = 0.5  # km
+sensor_height = 0.2  # km
+turning_speed = np.deg2rad(0.5)  # 0.5 degrees/s
 
-# Initial satellite state
-initial_angle = np.pi / 4
-pos_x = center_x + orbital_radius * np.cos(initial_angle)
-pos_y = center_y + orbital_radius * np.sin(initial_angle)
-vel_x = -orbital_radius * angular_velocity * np.sin(initial_angle)
-vel_y = orbital_radius * angular_velocity * np.cos(initial_angle)
-x0_true = np.array([pos_x, vel_x, pos_y, vel_y], dtype=np.float32)
+# Initial object state (position in km, velocity in km/s)
+x0_true = np.array([2000, 0, 10000, -40], dtype=np.float32)  # Initial position and velocity
 
 # Set up sensor network
-num_static_sensors = 8
-sensor_radius = 20
+# Static sensor positions
 static_sensors = [
-    [
-        center_x + sensor_radius * np.cos(2 * np.pi * i / num_static_sensors),
-        center_y + sensor_radius * np.sin(2 * np.pi * i / num_static_sensors),
-        sensor_height
-    ]
-    for i in range(num_static_sensors)
+    [2500, 1000, sensor_height],  # Sensor 1
+    [3500, 1000, sensor_height],  # Sensor 2
+    [4500, 1000, sensor_height],  # Sensor 3
 ]
-mobile_sensor = [15, 10, sensor_height]
-mobile_sensor_vel = [0.05, 0.05, 0]
+# Mobile sensor initial position and velocity
+mobile_sensor = [1500, 0, sensor_height]  # Sensor 4
+mobile_sensor_vel = [10, 20, 0]  # Velocity of mobile sensor (10 km/s in X, 20 km/s in Y)
 sensor_positions = [static_sensors + [mobile_sensor]]
 num_nodes = len(static_sensors) + 1
 
+# Calculate positions of all sensors at each time step
 for k in range(1, len(t)):
     current_positions = []
     for i, sensor in enumerate(sensor_positions[-1]):
-        if i == num_nodes - 1:
+        if i == num_nodes - 1:  # Mobile sensor
             new_pos = [
                 sensor[0] + mobile_sensor_vel[0] * dt,
                 sensor[1] + mobile_sensor_vel[1] * dt,
-                sensor[2] + mobile_sensor_vel[2] * dt
+                sensor[2]
             ]
             current_positions.append(new_pos)
-        else:
+        else:  # Static sensors
             current_positions.append(sensor.copy())
     sensor_positions.append(current_positions)
 
 mobile_sensor_trajectory = np.array([sensor_positions[k][num_nodes - 1] for k in range(len(t))])
 
 # Process and measurement noise
-Q = np.diag([1e-6, 1e-6, 1e-6, 1e-6]).astype(np.float32)
+Q = np.eye(n) * 1e-5  # Process noise covariance as specified: 10^-5 * I
 R_base = np.diag([0.1**2, np.deg2rad(1)**2, np.deg2rad(1)**2]).astype(np.float32)
 
-# Generate variant measurement noise for each node's sensors
-base_var = np.array([0.1**2, np.deg2rad(1)**2, np.deg2rad(1)**2])
-noise_variation = 0.5
-node_variances = [
-    base_var * (1 + np.random.uniform(-noise_variation, noise_variation, size=m))
-    for _ in range(num_nodes)
-]
+# Generate measurement noise for each node's sensors
+base_var = np.array([0.1**2, np.deg2rad(1)**2, np.deg2rad(1)**2])  
+node_variances = [base_var for _ in range(num_nodes)]
 R_list = [np.diag(var) for var in node_variances]
-worst_variances = np.max(node_variances, axis=0)
-R_worst = np.diag(worst_variances)
 
-# Satellite motion model function
-def satellite_motion_model(x, dt):
-    pos_x, vel_x, pos_y, vel_y = x
-    rx = pos_x - center_x
-    ry = pos_y - center_y
-    r = np.sqrt(rx**2 + ry**2)
-    angular_velocity = 2 * np.pi / orbital_period
-    ax = -rx * angular_velocity**2
-    ay = -ry * angular_velocity**2
-    new_pos_x = pos_x + vel_x * dt + 0.5 * ax * dt**2
-    new_vel_x = vel_x + ax * dt
-    new_pos_y = pos_y + vel_y * dt + 0.5 * ay * dt**2
-    new_vel_y = vel_y + ay * dt
-    return np.array([new_pos_x, new_vel_x, new_pos_y, new_vel_y])
+# Object motion model function with slower movement and exact final destination
+def object_motion_model(x, dt):
+    # Linear motion model
+    F = np.array([
+        [1, dt, 0, 0],
+        [0, 1, 0, 0],
+        [0, 0, 1, dt],
+        [0, 0, 0, 1]
+    ])
+    
+    # Turning points and final destination
+    turn_point1 = np.array([2000, 4000])
+    turn_point2 = np.array([4000, 2500])
+    final_dest = np.array([4000, -1000])
+    
+    current_pos = np.array([x[0], x[2]])
+    
+    # Check if we've passed the turning points
+    passed_turn1 = x[2] <= 4000 and current_pos[0] >= 2000
+    passed_turn2 = passed_turn1 and current_pos[0] >= 4000 and current_pos[1] <= 2500
+    near_final = np.linalg.norm(current_pos - final_dest) < 300
+    
+    # Snap to final destination if close enough
+    if near_final:
+        return np.array([final_dest[0], 0, final_dest[1], 0])  # Stop at final destination
+    
+    # Smoothly approach the second turning point
+    if passed_turn1 and not passed_turn2:
+        direction = turn_point2 - current_pos
+        direction = direction / (np.linalg.norm(direction) + 1e-10)
+        speed = 30  # Slower constant speed between turning points
+        new_vx = direction[0] * speed
+        new_vy = direction[1] * speed
+        return np.array([x[0] + new_vx * dt, new_vx, x[2] + new_vy * dt, new_vy])
+    
+    # Smoothly approach the first turning point
+    elif not passed_turn1:
+        direction = turn_point1 - current_pos
+        direction = direction / (np.linalg.norm(direction) + 1e-10)
+        speed = 30  # Slower constant speed toward the first turning point
+        new_vx = direction[0] * speed
+        new_vy = direction[1] * speed
+        return np.array([x[0] + new_vx * dt, new_vx, x[2] + new_vy * dt, new_vy])
+    
+    # After the second turning point, move toward the final destination
+    elif passed_turn2:
+        direction = final_dest - current_pos
+        direction = direction / (np.linalg.norm(direction) + 1e-10)
+        speed = 30  # Slower constant speed toward the final destination
+        new_vx = direction[0] * speed
+        new_vy = direction[1] * speed
+        return np.array([x[0] + new_vx * dt, new_vx, x[2] + new_vy * dt, new_vy])
+    
+    # Fallback to standard motion model
+    return F @ x
 
-# Measurement model
+# Measurement model as specified in equation (73)
 def measurement_model(x, sensor_pos):
-    dx = x[0] - sensor_pos[0]
-    dy = x[2] - sensor_pos[1]
-    dz = target_height - sensor_pos[2]
-    r = np.sqrt(dx**2 + dy**2 + dz**2)
+    dx = x[0] - sensor_pos[0]  # ξk - x^i_k
+    dy = x[2] - sensor_pos[1]  # ηk - y^i_k
+    h = target_height - sensor_pos[2]  # Height difference
+    
+    # Distance calculation: sqrt((ξk - x^i_k)^2 + (ηk - y^i_k)^2 + h^2)
+    d_squared = dx**2 + dy**2
+    r = np.sqrt(d_squared + h**2)
+    
+    # Azimuth angle: arctan((ηk - y^i_k)/(ξk - x^i_k))
     psi = np.arctan2(dy, dx)
-    theta = np.arctan2(dz, np.sqrt(dx**2 + dy**2))
+    
+    # Pitch angle: arctan(h/sqrt((ξk - x^i_k)^2 + (ηk - y^i_k)^2))
+    theta = np.arctan2(h, np.sqrt(d_squared))
+    
     return np.array([r, psi, theta])
+
+# Generate true object trajectory
+x = np.zeros((n, len(t)))
+x[:, 0] = x0_true
+z = np.zeros((m, len(t), num_nodes))
+w = np.random.multivariate_normal(mean=np.zeros(n), cov=Q, size=len(t)).T
+
+for k in range(1, len(t)):
+    # State propagation with process noise
+    x[:, k] = object_motion_model(x[:, k-1], dt) + w[:, k]
+    
+    # Generate measurements for each sensor
+    for node in range(num_nodes):
+        sensor_pos = sensor_positions[k][node]
+        true_measurement = measurement_model(x[:, k], sensor_pos)
+        v = np.random.multivariate_normal(mean=np.zeros(m), cov=R_list[node])
+        z[:, k, node] = true_measurement + v
 
 # Import torch for sigmoid saturation
 import torch
@@ -135,27 +184,6 @@ def ekf(x, z, P, Q, R, motion_model, measurement_model, sensor_pos, delta, alpha
     x_updated = x_pred + K @ (sat * innov)
     P_updated = (np.eye(n) - K @ H) @ P_pred
     return x_updated, P_updated, z_pred
-
-# Generate true satellite trajectory
-x = np.zeros((n, len(t)))
-x[:, 0] = x0_true
-z = np.zeros((m, len(t), num_nodes))
-w = np.random.multivariate_normal(mean=np.zeros(n), cov=Q, size=len(t)).T
-
-for k in range(1, len(t)):
-    fault_time_index = len(t) // 1
-    is_fault_active = k >= fault_time_index
-    if is_fault_active:
-        fault_bias = np.array([0.05, 0.003, -0.04, 0.002], dtype=np.float32)
-        fault_process_noise_multiplier = 5.0
-        x[:, k] = satellite_motion_model(x[:, k-1], dt) + fault_bias + w[:, k] * fault_process_noise_multiplier
-    else:
-        x[:, k] = satellite_motion_model(x[:, k-1], dt) + w[:, k]
-    for node in range(num_nodes):
-        sensor_pos = sensor_positions[k][node]
-        true_measurement = measurement_model(x[:, k], sensor_pos)
-        v = np.random.multivariate_normal(mean=np.zeros(m), cov=np.diag(node_variances[node]))
-        z[:, k, node] = true_measurement + v
 
 # Initialize variables for tracking
 x_kf = np.zeros((n, len(t), num_nodes))
@@ -220,17 +248,10 @@ for k in range(1, len(t)):
 
         # Train LSTM model every 10 steps with early stopping
         if k % 50 == 0:
-            # Adaptive weighting for averaging weights from other nodes
+            # Average weights from all other nodes
             other_weights = [lstm_models[other_node].get_weights() for other_node in range(num_nodes) if other_node != node]
-            adaptive_weights = []
-            for layer in range(len(other_weights[0])):
-                layer_weights = np.array([weights[layer] for weights in other_weights])
-                node_errors = np.array([np.mean(squared_error_kf[:, k-1, other_node]) for other_node in range(num_nodes) if other_node != node])
-                weights_factors = 1 / (node_errors + 1e-6)  # Inverse of errors as weights
-                weights_factors /= np.sum(weights_factors)  # Normalize
-                adaptive_layer_weights = np.tensordot(weights_factors, layer_weights, axes=(0, 0))
-                adaptive_weights.append(adaptive_layer_weights)
-            lstm_model.set_weights(adaptive_weights)
+            mean_weights = [np.mean([weights[layer] for weights in other_weights], axis=0) for layer in range(len(other_weights[0]))]
+            lstm_model.set_weights(mean_weights)
 
             # Train the model
             epochs = 10  # Increase epochs for better training
@@ -258,7 +279,7 @@ for k in range(1, len(t)):
         # Perform EKF update with predicted Q, R, and delta
         x_updated, P_updated, z_pred = ekf(
             x_kf[:, k-1, node], z_node, P_kf[node], Q_pred, R_pred,
-            satellite_motion_model, measurement_model, sensor_pos, delta
+            object_motion_model, measurement_model, sensor_pos, delta
         )
 
         # Compute loss (mean squared error between predicted and actual measurements)
@@ -300,6 +321,16 @@ overall_rmse = np.sqrt(np.mean(np.mean(squared_error_kf, axis=2), axis=1))
 # Print overall RMSE as an array or scalar
 print(f"\nOverall RMSE for the estimate (per state): {overall_rmse}")
 print(f"Mean Overall RMSE: {np.mean(overall_rmse):.6f}")
+
+# Calculate total distance traveled by the object
+total_distance = np.sum(np.sqrt(np.diff(x[0, :])**2 + np.diff(x[2, :])**2))
+
+# Normalize RMSE by total distance to get RMSE per kilometer
+rmse_per_km = overall_rmse / total_distance
+
+# Print RMSE per kilometer
+print(f"RMSE per kilometer (per state): {rmse_per_km}")
+print(f"Mean RMSE per kilometer: {np.mean(rmse_per_km):.6f}")
 
 # Visualization of results
 plt.figure(figsize=(15, 12))
@@ -366,3 +397,109 @@ plt.grid(True)
 plt.tight_layout()
 plt.savefig('satellite_tracking_results_numpy.png', dpi=300)
 plt.show()
+
+import csv  # Import CSV module for saving results
+
+# Save system model and results to separate CSV files for each state
+for state_idx in range(n):
+    csv_file_path = f'estimation_results_state_{state_idx}.csv'
+    
+    with open(csv_file_path, mode='w', newline='') as csv_file:
+        csv_writer = csv.writer(csv_file)
+        
+        # Write headers
+        csv_writer.writerow(['Time (sec)', 'Node', 'True Value', 'Estimated Value', 'Squared Error', 'RMSE'])
+        
+        # Write data for each time step and node
+        for k in range(1, len(t)):
+            for node in range(num_nodes):
+                true_value = x[state_idx, k]
+                estimated_value = x_kf[state_idx, k, node]
+                squared_error = squared_error_kf[state_idx, k, node]
+                rmse = np.sqrt(np.mean(squared_error_kf[state_idx, :k+1, node]))
+                csv_writer.writerow([t[k], node, true_value, estimated_value, squared_error, rmse])
+    
+    print(f"Estimation results for state {state_idx} saved to {csv_file_path}")
+
+# Save overall RMSE to a summary CSV
+summary_csv_file_path = 'overall_rmse_summary.csv'
+with open(summary_csv_file_path, mode='w', newline='') as csv_file:
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(['State', 'Overall RMSE'])
+    for state_idx, rmse in enumerate(overall_rmse):
+        csv_writer.writerow([f'State {state_idx}', rmse])
+    csv_writer.writerow(['Mean Overall RMSE', np.mean(overall_rmse)])
+
+print(f"Overall RMSE summary saved to {summary_csv_file_path}")
+
+# Save true system model to a single CSV
+true_csv_file_path = 'true_system_model.csv'
+with open(true_csv_file_path, mode='w', newline='') as csv_file:
+    csv_writer = csv.writer(csv_file)
+    
+    # Write headers
+    csv_writer.writerow(['Time (sec)'] + [f'State {i} (True)' for i in range(n)])
+    
+    # Write true values for each time step
+    for k in range(len(t)):
+        csv_writer.writerow([t[k]] + list(x[:, k]))
+    
+print(f"True system model saved to {true_csv_file_path}")
+
+# Save estimated system model to a single CSV
+estimate_csv_file_path = 'estimated_system_model.csv'
+with open(estimate_csv_file_path, mode='w', newline='') as csv_file:
+    csv_writer = csv.writer(csv_file)
+    
+    # Write headers
+    csv_writer.writerow(['Time (sec)'] + [f'State {i} (Estimate)' for i in range(n)])
+    
+    # Write estimated values (averaged across nodes) for each time step
+    for k in range(len(t)):
+        estimated_values = np.mean(x_kf[:, k, :], axis=1)  # Average across nodes
+        csv_writer.writerow([t[k]] + list(estimated_values))
+    
+print(f"Estimated system model saved to {estimate_csv_file_path}")
+
+# Save 3D plot data (sensor movements and locations) to a CSV
+csv_3d_plot_file_path = '3d_plot_data.csv'
+
+with open(csv_3d_plot_file_path, mode='w', newline='') as csv_file:
+    csv_writer = csv.writer(csv_file)
+    
+    # Write headers
+    csv_writer.writerow(['Time (sec)', 'Sensor Type', 'Sensor Index', 'X Position', 'Y Position', 'Z Position'])
+    
+    # Write static sensor positions (constant over time)
+    for i, sensor in enumerate(static_sensors):
+        csv_writer.writerow([0, 'Static', i, sensor[0], sensor[1], sensor[2]])
+    
+    # Write mobile sensor trajectory over time
+    for k, position in enumerate(mobile_sensor_trajectory):
+        csv_writer.writerow([t[k], 'Mobile', 0, position[0], position[1], position[2]])
+    
+    # Write true satellite trajectory over time
+    for k in range(len(t)):
+        csv_writer.writerow([t[k], 'Satellite (True)', 0, x[0, k], x[2, k], target_height])
+    
+    # Write estimated satellite trajectory (averaged across nodes) over time
+    estimated_trajectory = np.mean(x_kf, axis=2)
+    for k in range(len(t)):
+        csv_writer.writerow([t[k], 'Satellite (Estimate)', 0, estimated_trajectory[0, k], estimated_trajectory[2, k], target_height])
+
+print(f"3D plot data saved to {csv_3d_plot_file_path}")
+
+# Save mean RMSE per time step to a CSV
+mean_rmse_csv_file_path = 'dest_mean_rmse_per_timestep.csv'
+with open(mean_rmse_csv_file_path, mode='w', newline='') as csv_file:
+    csv_writer = csv.writer(csv_file)
+    
+    # Write headers
+    csv_writer.writerow(['Time (sec)', 'Mean RMSE'])
+    
+    # Write mean RMSE for each time step
+    for k in range(1, len(t)):
+        mean_rmse = np.mean(rmse_adldkf_state[k])
+        csv_writer.writerow([t[k], mean_rmse])
+
+print(f"Mean RMSE per time step saved to {mean_rmse_csv_file_path}")
