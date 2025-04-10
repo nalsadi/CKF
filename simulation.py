@@ -58,6 +58,7 @@ window_size = 10  # Number of past measurements to consider
 hidden_dim = 32
 output_dim = n + m  # Dimensions for Q (n×n) and R (m×m) diagonals
 lstm_model = QREstimatorLSTM(m, hidden_dim, output_dim)
+optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)  # Define this once outside
 
 # --- Simulate True Trajectory and Measurements ---
 for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
@@ -82,32 +83,37 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
     if k % 10 == 0:
         z_input = z[:, -window_size:]
         z_input = z_input.reshape(1, window_size, m)
-        for epoch in range(2):
 
-            lstm_output = lstm_model.lstm.predict(z_input, verbose=0)
-            q_diag = lstm_output[0, :n]  # First n values for Q diagonal
-            r_diag = lstm_output[0, n:]  # Next m values for R diagonal
-            print(q_diag, r_diag)
+        for epoch in range(10):
+            with tf.GradientTape() as tape:
+                lstm_output = lstm_model.lstm(z_input, training=True)
+                q_diag = lstm_output[0, :n]
+                r_diag = lstm_output[0, n:]
 
-            filterpy_assf.Q = np.diag(q_diag)
-            filterpy_assf.R = np.diag(r_diag)
+                # Stay in TensorFlow
+                Q_tf = tf.linalg.diag(q_diag)
+                R_tf = tf.linalg.diag(r_diag)
 
-             # Innovation sequence
-            z_pred = filterpy_measurement_model(filterpy_assf.x)
-            innovation = z[:, k+1] - z_pred
-            
-            # Innovation covariance
-            H = filterpy_jacobian_measurement(filterpy_assf.x)
-            S = H @ filterpy_assf.P @ H.T + filterpy_assf.R
-            
-            # NIS (Normalized Innovation Squared) loss
-            nis = innovation.T @ np.linalg.inv(S) @ innovation
-            loss = nis + 0.1 * (tf.reduce_sum(q_diag) + tf.reduce_sum(r_diag))  # Add regularization
-            
+                # Assume filterpy_assf.x and filterpy_assf.P are numpy arrays
+                H = tf.convert_to_tensor(filterpy_jacobian_measurement(filterpy_assf.x), dtype=tf.float32)
+                x_tf = tf.convert_to_tensor(filterpy_assf.x, dtype=tf.float32)
+                P_tf = tf.convert_to_tensor(filterpy_assf.P, dtype=tf.float32)
+
+                z_pred = tf.convert_to_tensor(filterpy_measurement_model(filterpy_assf.x), dtype=tf.float32)
+                innovation = tf.convert_to_tensor(z[:, k+1], dtype=tf.float32) - z_pred
+
+                S = H @ P_tf @ tf.transpose(H) + R_tf
+
+                S_inv = tf.linalg.inv(S)
+                nis = tf.matmul(tf.matmul(tf.expand_dims(innovation, axis=0), S_inv), tf.expand_dims(innovation, axis=1))
+
+                loss = nis[0, 0] + 0.1 * (tf.reduce_sum(q_diag) + tf.reduce_sum(r_diag))
+
+            grads = tape.gradient(loss, lstm_model.lstm.trainable_variables)
+            optimizer.apply_gradients(zip(grads, lstm_model.lstm.trainable_variables))
+
             print("Loss:", loss.numpy())
-
-            
-   
+        
 
         
     filterpy_assf.predict()
