@@ -9,6 +9,7 @@ from lstm_rewrite import QREstimatorLSTM, sigmoid_saturation, ekf, delta_opt, Q_
 import tensorflow as tf
 
 np.random.seed(42)
+tf.random.set_seed(42)
 
 w = np.random.multivariate_normal(mean=np.zeros(n), cov=Q, size=len(t)).T
 v = np.random.multivariate_normal(mean=np.zeros(m), cov=R, size=len(t)).T
@@ -51,14 +52,19 @@ class QREstimatorLSTM:
             tf.keras.layers.LSTM(hidden_dim, input_shape=(None, input_dim)),
             tf.keras.layers.Dense(output_dim, activation='softplus')  # Ensure positive values
         ])
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
         
 # Initialize the LSTM model
 window_size = 10  # Number of past measurements to consider
-hidden_dim = 32
+hidden_dim = 32*4
 output_dim = n + m  # Dimensions for Q (n×n) and R (m×m) diagonals
 lstm_model = QREstimatorLSTM(m, hidden_dim, output_dim)
-optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)  # Define this once outside
+# Use learning rate scheduling
+initial_learning_rate = 0.1
+lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+    initial_learning_rate, decay_steps=100, decay_rate=0.9
+)
+optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+
 
 # --- Simulate True Trajectory and Measurements ---
 for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
@@ -78,9 +84,9 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
     #--------------------------------------------------------------------------------------------------
     
 
-    # Update filterpy ASSF ----------------------------------------------------------------------------------------------------------
-    
-    if k % 10 == 0:
+    # Update filterpy ASSF ----------------------------------------------------------------------------------------------------------    
+    if k % 20 == 0:
+        print("Before Prediction:", np.diag(filterpy_assf.Q))
         z_input = z[:, -window_size:]
         z_input = z_input.reshape(1, window_size, m)
 
@@ -93,6 +99,9 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
                 # Stay in TensorFlow
                 Q_tf = tf.linalg.diag(q_diag)
                 R_tf = tf.linalg.diag(r_diag)
+
+                filterpy_assf.Q = np.diag(q_diag)
+                filterpy_assf.R = np.diag(r_diag)   
 
                 # Assume filterpy_assf.x and filterpy_assf.P are numpy arrays
                 H = tf.convert_to_tensor(filterpy_jacobian_measurement(filterpy_assf.x), dtype=tf.float32)
@@ -107,14 +116,14 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
                 S_inv = tf.linalg.inv(S)
                 nis = tf.matmul(tf.matmul(tf.expand_dims(innovation, axis=0), S_inv), tf.expand_dims(innovation, axis=1))
 
-                loss = nis[0, 0] + 0.1 * (tf.reduce_sum(q_diag) + tf.reduce_sum(r_diag))
+                loss = nis #nis[0, 0] + 0.1 * (tf.reduce_sum(q_diag) + tf.reduce_sum(r_diag))
 
             grads = tape.gradient(loss, lstm_model.lstm.trainable_variables)
             optimizer.apply_gradients(zip(grads, lstm_model.lstm.trainable_variables))
 
             print("Loss:", loss.numpy())
-        
-
+ 
+    print("After Training:", np.diag(filterpy_assf.Q))
         
     filterpy_assf.predict()
     filterpy_assf.update(
