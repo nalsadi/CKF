@@ -2,17 +2,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 import torch 
+from filterpy.kalman import ExtendedKalmanFilter
+from system_model_write import object_motion_model, T, n, m,t,dt, target_height, Q, R,measurement_model
+from ekf_rewrite import filterpy_motion_model, filterpy_measurement_model, filterpy_jacobian_motion, filterpy_jacobian_measurement
+
 
 
 np.random.seed(42)
-
-
-tf = 500
-dt = 1  # Time interval (seconds)
-T = dt  # Ensure consistency
-t = np.arange(0, tf + dt, dt)  # Update time array
-n = 4
-m = 3
 
 
 
@@ -32,41 +28,6 @@ class QREstimatorLSTM:
             h = np.tanh(np.dot(self.weights_ih, x[:, t]) + np.dot(self.weights_hh, h) + self.bias_h)
         out = np.dot(self.weights_fc, h) + self.bias_fc
         return np.log(1 + np.exp(out))  # Softplus activation
-
-
-# Uniform motion model
-UM = np.array([
-    [1, T, 0, 0],
-    [0, 1, 0, 0],
-    [0, 0, 1, T],
-    [0, 0, 0, 1]
-])
-
-# Coordinated turn model
-def CT(w):
-    if abs(w) < 1e-6:
-        return UM
-    else:
-        return np.array([
-            [1, np.sin(w * T) / w, 0, -(1 - np.cos(w * T)) / w],
-            [0, np.cos(w * T), 0, -np.sin(w * T)],
-            [0, (1 - np.cos(w * T)) / w, 1, np.sin(w * T) / w],
-            [0, np.sin(w * T), 0, np.cos(w * T)]
-        ])
-
-# Object motion model function
-def object_motion_model(x, dt, k):
-    if t[k] <= 125:
-        return UM @ x
-    elif 125 < t[k] <= 215:
-        return CT(np.deg2rad(1)) @ x
-    elif 215 < t[k] <= 340:
-        return UM @ x
-    elif 340 < t[k] <= 370:
-        return CT(np.deg2rad(-3)) @ x
-    else:
-        return UM @ x
-
 
 
 
@@ -100,14 +61,6 @@ def ekf(k,x, z, P, Q, R, motion_model, measurement_model, sensor_pos, delta, alp
     return x_updated, P_updated, z_pred
 
 
-L1 = 0.16
-Q = L1 * np.array([
-    [T**3 / 3, T**2 / 2, 0, 0],
-    [T**2 / 2, T, 0, 0],
-    [0, 0, T**3 / 3, T**2 / 2],
-    [0, 0, T**2 / 2, T]
-])
-R = np.diag([500**2, np.deg2rad(1)**2, np.deg2rad(1)**2])  # Noise for [r, psi, theta]
 
 w = np.random.multivariate_normal(mean=np.zeros(n), cov=Q, size=len(t)).T
 v = np.random.multivariate_normal(mean=np.zeros(m), cov=R, size=len(t)).T
@@ -135,28 +88,15 @@ hidden_size = 32  # Hidden state size of LSTM
 output_size = n + m + m  # Output is diagonal of Q, R, and delta
 lstm_model = QREstimatorLSTM(input_size, hidden_size, output_size)
 
-
-
-# Define target height (assumed constant for simplicity)
-target_height = 1000  # in meters
-
-# Updated measurement model function
-def measurement_model(x, sensor_pos):
-    dx = x[0] - sensor_pos[0]  # ξk - x^i_k
-    dy = x[2] - sensor_pos[1]  # ηk - y^i_k
-    h = target_height - sensor_pos[2]  # Height difference
-    
-    # Distance calculation: sqrt((ξk - x^i_k)^2 + (ηk - y^i_k)^2 + h^2)
-    d_squared = dx**2 + dy**2
-    r = np.sqrt(d_squared + h**2)
-    
-    # Azimuth angle: arctan((ηk - y^i_k)/(ξk - x^i_k))
-    psi = np.arctan2(dy, dx)
-    
-    # Pitch angle: arctan(h/sqrt((ξk - x^i_k)^2 + (ηk - y^i_k)^2))
-    theta = np.arctan2(h, np.sqrt(d_squared))
-    
-    return np.array([r, psi, theta])
+# Initialize filterpy EKF
+filterpy_ekf = ExtendedKalmanFilter(dim_x=n, dim_z=m)
+filterpy_ekf.x = x_true.flatten()
+filterpy_ekf.P = 10 * Q
+filterpy_ekf.Q = Q
+filterpy_ekf.R = R
+# Simulate filterpy EKF
+x_filterpy = np.zeros((n, len(t)))
+x_filterpy[:, 0] = x_true.flatten()
 
 # --- Simulate True Trajectory and Measurements ---
 for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
@@ -164,7 +104,15 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
     
     z[:, k+1] = measurement_model(x[:, k + 1], [0,0,0]) + v[:, k]
     
-    
+    # Update filterpy EKF
+    filterpy_ekf.F = filterpy_jacobian_motion(filterpy_ekf.x, T)
+    filterpy_ekf.predict()
+    filterpy_ekf.update(
+        z[:, k+1],
+        HJacobian=filterpy_jacobian_measurement,
+        Hx=filterpy_measurement_model
+    )
+    x_filterpy[:, k+1] = filterpy_ekf.x
     
     # Every 100 steps, use LSTM to estimate Q and R
     if k % 10 == 0:
@@ -226,26 +174,33 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
         Q_opt = Q_new
         R_opt = R_new
         delta_opt = delta_out
-        exit()
+       # exit()
     # Replace the ssif line with ekf
     x_kf[:, k], P_kf[:, :, k], _ = ekf(k, x_kf[:, k-1], z[:, k+1], P_kf[:, :, k-1], Q_opt, R_opt, 
                                       object_motion_model, measurement_model, [0,0,0], delta_opt)
     squared_error_assf[:, k+1] = (x[:, k+1] - x_kf[:, k])**2
 
+
+
+
 plt.figure(figsize=(10, 6))
 plt.plot(x[0, :], x[2, :], 'r-', linewidth=2, label='True Trajectory')
 plt.plot(x_kf[0, :], x_kf[2, :], 'b--', label='Kalman Filter Position')  # Fixed indexing
-plt.xlabel('Time (sec)')
-plt.ylabel('Position')
+plt.plot(x_filterpy[0, :], x_filterpy[2, :], 'g-.', label='FilterPy EKF Position')
+plt.xlabel('X Position')
+plt.ylabel('Y Position')
 plt.legend()
 plt.grid(True)
 plt.show()
 
 # Calculate RMSE for position and velocity only (since we have 4 state dimensions)
 rmse_assf = np.sqrt(np.mean(squared_error_assf[:, :-1], axis=1))
+rmse_filterpy = np.sqrt(np.mean((x[:, :-1] - x_filterpy[:, :-1])**2, axis=1))
+
 states = ['X Position', 'X Velocity', 'Y Position', 'Y Velocity']  # Match state dimensions
 results_rmse = pd.DataFrame({
     'State': states,
     'ASSF RMSE': rmse_assf,
+    'FilterPy EKF RMSE': rmse_filterpy
 })
 print(results_rmse)
