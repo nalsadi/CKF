@@ -5,60 +5,12 @@ import torch
 from filterpy.kalman import ExtendedKalmanFilter
 from system_model_write import object_motion_model, T, n, m,t,dt, target_height, Q, R,measurement_model
 from ekf_rewrite import filterpy_motion_model, filterpy_measurement_model, filterpy_jacobian_motion, filterpy_jacobian_measurement
-
+from lstm_rewrite import QREstimatorLSTM, sigmoid_saturation, ekf
 
 
 np.random.seed(42)
 
 
-
-class QREstimatorLSTM:
-    def __init__(self, input_size, hidden_size, output_size):
-        self.hidden_size = hidden_size
-        self.output_size = output_size
-        self.weights_ih = np.random.randn(hidden_size, input_size) * 0.01  # Input-to-hidden weights
-        self.weights_hh = np.random.randn(hidden_size, hidden_size) * 0.01  # Hidden-to-hidden weights
-        self.bias_h = np.zeros(hidden_size)  # Hidden bias
-        self.weights_fc = np.random.randn(output_size, hidden_size) * 0.01  # Fully connected layer weights
-        self.bias_fc = np.zeros(output_size)  # Fully connected layer bias
-
-    def forward(self, x):
-        h = np.zeros(self.hidden_size)  # Initialize hidden state
-        for t in range(x.shape[1]):
-            h = np.tanh(np.dot(self.weights_ih, x[:, t]) + np.dot(self.weights_hh, h) + self.bias_h)
-        out = np.dot(self.weights_fc, h) + self.bias_fc
-        return np.log(1 + np.exp(out))  # Softplus activation
-
-
-
-def sigmoid_saturation(innov, delta, alpha=1.0):
-    return 1 / (1 + np.exp(-alpha * (np.abs(innov) - delta)))
-
-def ekf(k,x, z, P, Q, R, motion_model, measurement_model, sensor_pos, delta, alpha=1.0):
-    n = len(x)
-    m = len(z)
-    x_pred = motion_model(x, T,k)
-    F = np.zeros((n, n))
-    epsilon = 1e-4
-    for j in range(n):
-        x_perturbed = x.copy()
-        x_perturbed[j] += epsilon
-        F[:, j] = (motion_model(x_perturbed, T,k) - x_pred) / epsilon
-    P_pred = F @ P @ F.T + Q
-    z_pred = measurement_model(x_pred, sensor_pos)
-    H = np.zeros((m, n))
-    for j in range(n):
-        x_perturbed = x_pred.copy()
-        x_perturbed[j] += epsilon
-        H[:, j] = (measurement_model(x_perturbed, sensor_pos) - z_pred) / epsilon
-    innov = z - z_pred
-    innov[1:3] = np.arctan2(np.sin(innov[1:3]), np.cos(innov[1:3]))
-    sat = sigmoid_saturation(torch.tensor(innov), torch.tensor(delta), alpha=alpha).numpy()
-    S = H @ P_pred @ H.T + R
-    K = P_pred @ H.T @ np.linalg.pinv(S)
-    x_updated = x_pred + K @ (sat * innov)
-    P_updated = (np.eye(n) - K @ H) @ P_pred
-    return x_updated, P_updated, z_pred
 
 
 
@@ -94,6 +46,7 @@ filterpy_ekf.x = x_true.flatten()
 filterpy_ekf.P = 10 * Q
 filterpy_ekf.Q = Q
 filterpy_ekf.R = R
+
 # Simulate filterpy EKF
 x_filterpy = np.zeros((n, len(t)))
 x_filterpy[:, 0] = x_true.flatten()
@@ -104,7 +57,7 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
     
     z[:, k+1] = measurement_model(x[:, k + 1], [0,0,0]) + v[:, k]
     
-    # Update filterpy EKF
+    # Update filterpy EKF ----------------------------------------------------------------------------------------------------------
     filterpy_ekf.F = filterpy_jacobian_motion(filterpy_ekf.x, T)
     filterpy_ekf.predict()
     filterpy_ekf.update(
@@ -113,7 +66,7 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
         Hx=filterpy_measurement_model
     )
     x_filterpy[:, k+1] = filterpy_ekf.x
-    
+    #--------------------------------------------------------------------------------------------------
     # Every 100 steps, use LSTM to estimate Q and R
     if k % 10 == 0:
         for epoch in range(100):
@@ -141,9 +94,6 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
             # ASSF
             x_kf_new, P_kf_new, z_pred_new = ekf(k,x_kf[:, k-1], z[:, k+1], P_kf[:, :, k-1], Q_new, R_new,object_motion_model,measurement_model,[0,0,0], delta_opt)
             
-            # x_updated, P_updated, z_pred = ekf(
-          #  x_kf[:, k-1], z_node, P_kf[node], Q_pred, R_pred,object_motion_model, measurement_model, sensor_pos, delta
-        
             # Compute loss
             loss = np.mean((z_pred_new - z[:, k+1])**2)
             print(f"Time step {k}: Loss = {loss}")
