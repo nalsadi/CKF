@@ -2,7 +2,6 @@ from system_model_write import object_motion_model, measurement_model, T, n, m,t
 import numpy as np
 import torch
 
-
 class QREstimatorLSTM:
     def __init__(self, input_size, hidden_size, output_size):
         self.hidden_size = hidden_size
@@ -51,3 +50,14 @@ def ekf(k,x, z, P, Q, R, motion_model, measurement_model, sensor_pos, delta, alp
     P_updated = (np.eye(n) - K @ H) @ P_pred
     return x_updated, P_updated, z_pred
 
+
+P_kf = np.zeros((n, n, len(t)))
+delta_opt = np.zeros(m)
+Q_opt = np.diag([0, 0, 0]).astype(np.float32)
+R_opt = np.diag([0, 0, 0]).astype(np.float32)
+
+# Initialize LSTM
+input_size = m  # Number of measurements as input
+hidden_size = 32  # Hidden state size of LSTM
+output_size = n + m + m  # Output is diagonal of Q, R, and delta
+lstm_model = QREstimatorLSTM(input_size, hidden_size, output_size)

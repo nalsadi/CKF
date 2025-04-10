@@ -5,40 +5,30 @@ import torch
 from filterpy.kalman import ExtendedKalmanFilter
 from system_model_write import object_motion_model, T, n, m,t,dt, target_height, Q, R,measurement_model
 from ekf_rewrite import filterpy_motion_model, filterpy_measurement_model, filterpy_jacobian_motion, filterpy_jacobian_measurement
-from lstm_rewrite import QREstimatorLSTM, sigmoid_saturation, ekf
+from lstm_rewrite import QREstimatorLSTM, sigmoid_saturation, ekf, delta_opt, Q_opt, R_opt, lstm_model, input_size, hidden_size, output_size,P_kf, delta_opt, Q_opt, R_opt, lstm_model, input_size, hidden_size, output_size,P_kf 
 
 
 np.random.seed(42)
 
-
-
-
-
 w = np.random.multivariate_normal(mean=np.zeros(n), cov=Q, size=len(t)).T
 v = np.random.multivariate_normal(mean=np.zeros(m), cov=R, size=len(t)).T
-
 x = np.zeros((n, len(t)))
 z = np.zeros((m, len(t)))
 u = np.zeros(len(t))
 
 
 x_kf = np.zeros((n, len(t)))
+x_filterpy = np.zeros((n, len(t)))
+
 x_true = np.array([[25e3], [-120], [10e3], [0]])
 x[:, 0] = x_true.flatten()
 x_kf[:, 0] = x_true.flatten()
-P_kf = np.zeros((n, n, len(t)))
+x_filterpy[:, 0] = x_true.flatten()
+
+
+
 P_kf[:, :, 0] = 10 * Q
-squared_error_assf = np.zeros((n, len(t)))
 
-delta_opt = np.zeros(m)
-Q_opt = np.diag([0, 0, 0]).astype(np.float32)
-R_opt = np.diag([0, 0, 0]).astype(np.float32)
-
-# Initialize LSTM
-input_size = m  # Number of measurements as input
-hidden_size = 32  # Hidden state size of LSTM
-output_size = n + m + m  # Output is diagonal of Q, R, and delta
-lstm_model = QREstimatorLSTM(input_size, hidden_size, output_size)
 
 # Initialize filterpy EKF
 filterpy_ekf = ExtendedKalmanFilter(dim_x=n, dim_z=m)
@@ -47,9 +37,7 @@ filterpy_ekf.P = 10 * Q
 filterpy_ekf.Q = Q
 filterpy_ekf.R = R
 
-# Simulate filterpy EKF
-x_filterpy = np.zeros((n, len(t)))
-x_filterpy[:, 0] = x_true.flatten()
+
 
 # --- Simulate True Trajectory and Measurements ---
 for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
@@ -128,7 +116,6 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
     # Replace the ssif line with ekf
     x_kf[:, k], P_kf[:, :, k], _ = ekf(k, x_kf[:, k-1], z[:, k+1], P_kf[:, :, k-1], Q_opt, R_opt, 
                                       object_motion_model, measurement_model, [0,0,0], delta_opt)
-    squared_error_assf[:, k+1] = (x[:, k+1] - x_kf[:, k])**2
 
 
 
@@ -144,7 +131,7 @@ plt.grid(True)
 plt.show()
 
 # Calculate RMSE for position and velocity only (since we have 4 state dimensions)
-rmse_assf = np.sqrt(np.mean(squared_error_assf[:, :-1], axis=1))
+rmse_assf = np.sqrt(np.mean((x[:, :-1] - x_kf[:, :-1])**2, axis=1))
 rmse_filterpy = np.sqrt(np.mean((x[:, :-1] - x_filterpy[:, :-1])**2, axis=1))
 
 states = ['X Position', 'X Velocity', 'Y Position', 'Y Velocity']  # Match state dimensions
