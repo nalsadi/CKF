@@ -7,9 +7,13 @@ from system_model_write import object_motion_model, T, n, m,t,dt, target_height,
 from ekf_rewrite import filterpy_motion_model, filterpy_measurement_model, filterpy_jacobian_motion, filterpy_jacobian_measurement
 from lstm_rewrite import QREstimatorLSTM, sigmoid_saturation, ekf, delta_opt, Q_opt, R_opt, lstm_model, input_size, hidden_size, output_size,P_kf, delta_opt, Q_opt, R_opt, lstm_model, input_size, hidden_size, output_size,P_kf 
 import tensorflow as tf
+import random
 
-np.random.seed(42)
-tf.random.set_seed(42)
+SEED = 42
+np.random.seed(SEED)  
+tf.random.set_seed(SEED)  
+torch.manual_seed(SEED)  
+random.seed(SEED)
 
 w = np.random.multivariate_normal(mean=np.zeros(n), cov=Q, size=len(t)).T
 v = np.random.multivariate_normal(mean=np.zeros(m), cov=R, size=len(t)).T
@@ -89,6 +93,7 @@ for k in range(len(t) - 1):  # Adjust loop range to avoid index out of bounds
         print("Before Prediction:", np.diag(filterpy_assf.Q))
         z_input = z[:, -window_size:]
         z_input = z_input.reshape(1, window_size, m)
+        z_input = (z_input - np.mean(z_input, axis=0)) / (np.std(z_input, axis=0) + 1e-8)
 
         for epoch in range(10):
             with tf.GradientTape() as tape:
