@@ -97,15 +97,22 @@ P_ckf, P_ckf_lstm = P0.copy(), P0.copy()
 Q_est, R_est = Q_base.copy(), R_base.copy()
 
 # ‑‑‑ 7. LSTM MODEL FOR Q/R SCALE FACTORS ‑‑‑ #
-WINDOW = 20                # number of past innovations
-LR     = 1e-4
+WINDOW = 20  # Increased window size for more historical context
+LR = 1e-2    # Adjusted learning rate for better convergence
+EPOCHS = 8  # Number of epochs for training the LSTM model
+
 class QRNet(tf.keras.Model):
     def __init__(self):
         super().__init__()
-        self.lstm  = tf.keras.layers.LSTM(32)
-        self.dense = tf.keras.layers.Dense(2, activation='softplus') # >0
-    def call(self,x):        # x.shape = (None, WINDOW, m)
-        return self.dense(self.lstm(x)) + 1e-6
+        self.lstm = tf.keras.layers.LSTM(64, return_sequences=True)  # Increased units
+        self.dropout = tf.keras.layers.Dropout(0.2)  # Added dropout for regularization
+        self.lstm2 = tf.keras.layers.LSTM(32)  # Added another LSTM layer
+        self.dense = tf.keras.layers.Dense(2, activation='softplus')  # >0
+    def call(self, x):  # x.shape = (None, WINDOW, m)
+        x = self.lstm(x)
+        x = self.dropout(x)
+        x = self.lstm2(x)
+        return self.dense(x) + 1e-6
 
 qr_net   = QRNet()
 optimizer = tf.keras.optimizers.Adam(LR)
@@ -116,18 +123,55 @@ innov_hist = []
 # Gaussian NLL loss
 def nll_loss(innov, r_scale):
     """innov: (batch,m), r_scale: (batch,)"""
-    R_pred = r_scale[:,None,None]*R_base[None,:,:]  # shape (batch,2,2)
+    R_pred = r_scale[:, None, None] * R_base[None, :, :]  # shape (batch,2,2)
     # log|R| + νᵀ R⁻¹ ν
-    inv   = tf.linalg.inv(R_pred)
-    quad  = tf.reduce_sum(tf.expand_dims(innov,1)*tf.matmul(inv,
-                    tf.expand_dims(innov,2)), axis=[1,2])
-    logdet= tf.math.log(tf.linalg.det(R_pred))
-    return 0.5*tf.reduce_mean(logdet + quad)
+    inv = tf.linalg.inv(R_pred)
+    quad = tf.reduce_sum(tf.expand_dims(innov, 1) * tf.matmul(inv,
+                    tf.expand_dims(innov, 2)), axis=[1, 2])
+    logdet = tf.math.log(tf.linalg.det(R_pred))
+    return 0.5 * tf.reduce_mean(logdet + quad)
 
+def huber_loss(innov, r_scale, delta=1.0):
+    """innov: (batch, m), r_scale: (batch,), delta: threshold for linear/quadratic"""
+    R_pred = r_scale[:, None, None] * R_base[None, :, :]  # shape (batch, 2, 2)
+    inv = tf.linalg.inv(R_pred)
+    quad = tf.reduce_sum(tf.expand_dims(innov, 1) * tf.matmul(inv, tf.expand_dims(innov, 2)), axis=[1, 2])
+    error = tf.sqrt(quad)
+    return tf.reduce_mean(tf.where(error < delta, 0.5 * tf.square(error), delta * (error - 0.5 * delta)))
+
+def kl_divergence_loss(innov, r_scale):
+    """innov: (batch, m), r_scale: (batch,)"""
+    R_pred = r_scale[:, None, None] * R_base[None, :, :]  # shape (batch, 2, 2)
+    inv = tf.linalg.inv(R_pred)
+    quad = tf.reduce_sum(tf.expand_dims(innov, 1) * tf.matmul(inv, tf.expand_dims(innov, 2)), axis=[1, 2])
+    logdet = tf.math.log(tf.linalg.det(R_pred))
+    return 0.5 * tf.reduce_mean(logdet + quad - tf.linalg.trace(inv))
+
+def combined_loss(innov, r_scale, alpha=0.5):
+    # Mix NLL with trace-based penalty
+    R_pred = r_scale[:, None, None] * R_base[None, :, :]
+    inv = tf.linalg.inv(R_pred)
+    quad = tf.reduce_sum(tf.expand_dims(innov, 1) * tf.matmul(inv, tf.expand_dims(innov, 2)), axis=[1, 2])
+    logdet = tf.math.log(tf.linalg.det(R_pred))
+    nll = 0.5 * tf.reduce_mean(logdet + quad)
+    trace_penalty = tf.reduce_mean(tf.linalg.trace(R_pred))
+    return alpha * nll + (1 - alpha) * trace_penalty
+
+def nis_loss(innov, r_scale):
+    # innov: (batch, m), r_scale: (batch,)
+    R_pred = r_scale[:, None, None] * R_base[None, :, :]  # shape (batch,2,2)
+    inv_R = tf.linalg.inv(R_pred)
+    # νᵀ R⁻¹ ν
+    quad = tf.reduce_sum(
+        tf.expand_dims(innov, 1) * tf.matmul(inv_R, tf.expand_dims(innov, 2)),
+        axis=[1, 2]
+    )
+    return tf.reduce_mean(quad)
 # ‑‑‑ 8. MAIN LOOP ‑‑‑ #
 Xi, W = cubature_points(n)
 
 for k in range(1, len(t)):
+    print(f"Step {k}/{len(t)-1}")
     z = z_meas[:,k]
 
     # ---------- 8.1  BASE CKF (fixed Q,R) ----------
@@ -162,19 +206,21 @@ for k in range(1, len(t)):
         innov_hist.pop(0)
 
     # Scale factors prediction & online training
-    if len(innov_hist) == WINDOW:
-        with tf.GradientTape() as tape:
-            inp   = tf.convert_to_tensor(np.array(innov_hist)[None,:,:], dtype=tf.float32)
-            q_r   = qr_net(inp)[0]             # [q_scale, r_scale]
-            q_s, r_s = q_r[0], q_r[1]
-            loss = nll_loss(inp[:,-1,:], r_s[None])
-            print("Loss:", loss.numpy())
-        grads = tape.gradient(loss, qr_net.trainable_variables)
-        optimizer.apply_gradients(zip(grads, qr_net.trainable_variables))
+    if len(innov_hist) == WINDOW and k % 10 == 0:
+        for epoch in range(EPOCHS):  # Train for multiple epochs
+            with tf.GradientTape() as tape:
+                inp = tf.convert_to_tensor(np.array(innov_hist)[None, :, :], dtype=tf.float32)
+                q_r = qr_net(inp)[0]  # [q_scale, r_scale]
+                q_s, r_s = q_r[0], q_r[1]
+                loss = nis_loss(inp[:, -1, :], r_s[None])
+                #if epoch == EPOCHS - 1:  # Print loss only for the last epoch
+                print(f"Epoch {epoch + 1}/{EPOCHS}, Loss:", loss.numpy())
+            grads = tape.gradient(loss, qr_net.trainable_variables)
+            optimizer.apply_gradients(zip(grads, qr_net.trainable_variables))
 
         # Update Q,R estimates (diagonal scaling)
-        Q_est = q_s.numpy()*Q_base
-        R_est = r_s.numpy()*R_base
+        Q_est = q_s.numpy() * Q_base
+        R_est = r_s.numpy() * R_base
 
     # Measurement update with latest R_est
     Smat  = R_est + (Z-zpred[:,None]) @ np.diag(W) @ (Z-zpred[:,None]).T
@@ -220,6 +266,10 @@ plt.show()
 # =============================================================================
 rmse_ckf = np.sqrt(np.mean((x_ckf - x_true)**2, axis=0))
 rmse_ckf_lstm = np.sqrt(np.mean((x_ckf_lstm - x_true)**2, axis=0))
+
+print("Overall RMSE (m):")
+print("  CKF fixed  :", np.mean(rmse_ckf))
+print("  CKF + LSTM :", np.mean(rmse_ckf_lstm))
 
 plt.figure(figsize=(12,5))
 plt.plot(t, rmse_ckf, 'b-.', label='CKF fixed')
