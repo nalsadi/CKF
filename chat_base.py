@@ -8,10 +8,12 @@ Real‑time CKF with on‑line LSTM tuning of Q and R.
 import numpy as np
 import matplotlib.pyplot as plt
 import tensorflow as tf
-
+import random
 # ‑‑‑ 1. PARAMETERS (exactly your originals) ‑‑‑ #
 np.random.seed(42)
 tf.random.set_seed(42)
+random.seed(42)
+
 
 dt, T, tfinal = 1.0, 1.0, 500
 t = np.arange(0, tfinal + dt, dt)
@@ -166,6 +168,7 @@ for k in range(1, len(t)):
             q_r   = qr_net(inp)[0]             # [q_scale, r_scale]
             q_s, r_s = q_r[0], q_r[1]
             loss = nll_loss(inp[:,-1,:], r_s[None])
+            print("Loss:", loss.numpy())
         grads = tape.gradient(loss, qr_net.trainable_variables)
         optimizer.apply_gradients(zip(grads, qr_net.trainable_variables))
 
