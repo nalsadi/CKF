@@ -211,3 +211,20 @@ plt.grid(True)
 plt.axis('equal')  # Equal aspect ratio to properly show motion
 plt.tight_layout()
 plt.show()
+
+# =============================================================================
+# 11. Plot RMSE Over Time
+# =============================================================================
+rmse_ckf = np.sqrt(np.mean((x_ckf - x_true)**2, axis=0))
+rmse_ckf_lstm = np.sqrt(np.mean((x_ckf_lstm - x_true)**2, axis=0))
+
+plt.figure(figsize=(12,5))
+plt.plot(t, rmse_ckf, 'b-.', label='CKF fixed')
+plt.plot(t, rmse_ckf_lstm, 'r--', label='CKF + LSTM')
+plt.xlabel('Time (s)')
+plt.ylabel('RMSE (m)')
+plt.title('RMSE Over Time')
+plt.grid()
+plt.legend()
+plt.tight_layout()
+plt.show()
